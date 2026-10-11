@@ -1,0 +1,13 @@
+# Optional: lets Render create the service from this repo ("New > Blueprint").
+# You can ignore this file and set everything up in the dashboard instead (see README).
+services:
+  - type: web
+    name: cat-translate-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: API_TOKEN
+        sync: false        # Render asks you for the value; it is never stored in the repo
+      - key: ALLOWED_ORIGINS
+        sync: false
