@@ -6,12 +6,15 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 MIN_TOKEN_LENGTH = 16
-DEFAULT_ORDER = ("google_web", "mymemory", "google_gtx")
+DEFAULT_ORDER = ("gemini", "cloudflare", "mymemory")
 DEFAULT_DELAYS = {
+    "gemini": (4.0, 5.0),
+    "cloudflare": (0.5, 1.0),
+    "mymemory": (0.5, 1.0),
     "google_web": (0.6, 1.4),
     "google_gtx": (0.6, 1.4),
-    "mymemory": (0.5, 1.0),
 }
+DEFAULT_GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemma-4-26b-a4b-it")
 FALLBACK_DELAY = (0.6, 1.4)
 
 
@@ -102,10 +105,22 @@ class Settings:
     batch_deadline_seconds: float = 80.0
     selftest_min_interval_seconds: float = 60.0
     log_level: str = "INFO"
+    gemini_api_key: str = ""
+    gemini_models: tuple[str, ...] = DEFAULT_GEMINI_MODELS
+    cloudflare_account_id: str = ""
+    cloudflare_api_token: str = ""
+    cloudflare_model: str = "@cf/meta/m2m100-1.2b"
+    mymemory_email: str = ""
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
-        env = os.environ if env is None else env
+        if env is None:
+            try:
+                import dotenv
+                dotenv.load_dotenv()
+            except ImportError:
+                pass
+            env = os.environ
         token = (env.get("API_TOKEN") or "").strip()
         if len(token) < MIN_TOKEN_LENGTH:
             raise ConfigError(
@@ -135,4 +150,10 @@ class Settings:
             batch_deadline_seconds=_number(env, "BATCH_DEADLINE_SECONDS", 80.0, float, 5, 600),
             selftest_min_interval_seconds=_number(env, "SELFTEST_MIN_INTERVAL_SECONDS", 60.0, float, 0, 3600),
             log_level=level,
+            gemini_api_key=(env.get("GEMINI_API_KEY") or "").strip(),
+            gemini_models=_names(env.get("GEMINI_MODELS")) or DEFAULT_GEMINI_MODELS,
+            cloudflare_account_id=(env.get("CLOUDFLARE_ACCOUNT_ID") or "").strip(),
+            cloudflare_api_token=(env.get("CLOUDFLARE_API_TOKEN") or "").strip(),
+            cloudflare_model=(env.get("CLOUDFLARE_MODEL") or "@cf/meta/m2m100-1.2b").strip(),
+            mymemory_email=(env.get("MYMEMORY_EMAIL") or "").strip(),
         )

@@ -1,9 +1,10 @@
 """MyMemory (free, with daily limits) through deep-translator. Used as the fallback."""
 from __future__ import annotations
 
+import os
 import re
 
-from ..textutils import chunk_text
+from ..textutils import check_tags_preserved, chunk_text, normalize_ascii_digits
 from .base import EMPTY, RATE_LIMITED, UNSUPPORTED, Engine, EngineError
 from .errors import classify_exception
 
@@ -41,6 +42,9 @@ def check_mymemory_text(out: str | None) -> str:
 class MyMemoryEngine(Engine):
     name = "mymemory"
 
+    def __init__(self, email: str = ""):
+        self.email = (email or os.environ.get("MYMEMORY_EMAIL", "")).strip()
+
     def supports(self, sl: str, tl: str) -> bool:
         return locale_for(sl) is not None and locale_for(tl) is not None
 
@@ -50,7 +54,8 @@ class MyMemoryEngine(Engine):
             raise EngineError(UNSUPPORTED, f"No MyMemory locale known for {sl!r} or {tl!r}.")
         from deep_translator import MyMemoryTranslator
 
-        translator = MyMemoryTranslator(source=src, target=tgt)
+        kwargs = {"email": self.email} if self.email else {}
+        translator = MyMemoryTranslator(source=src, target=tgt, **kwargs)
         parts: list[str] = []
         for piece in chunk_text(text, MAX_CHUNK):
             try:
@@ -58,4 +63,9 @@ class MyMemoryEngine(Engine):
             except Exception as exc:  # noqa: BLE001
                 raise classify_exception(exc) from None
             parts.append(check_mymemory_text(out))
-        return " ".join(parts).strip()
+        joined = " ".join(parts).strip()
+        normalized = normalize_ascii_digits(joined)
+        tags_ok, missing_tag = check_tags_preserved(text, normalized)
+        if not tags_ok:
+            raise EngineError(EMPTY, f"MyMemory lost tag '{missing_tag}' in translation.")
+        return normalized

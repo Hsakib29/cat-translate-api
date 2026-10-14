@@ -28,6 +28,41 @@ def scrub(message: object, text: str = "", limit: int = 200) -> str:
     return msg
 
 
+_TAG_PATTERN = re.compile(r"\{\s*[\w\d]+\s*\}|<[^>]+>")
+
+# Map non-ASCII localized digits to standard ASCII 0-9
+_VERNACULAR_DIGITS = {
+    # Bengali ০-৯
+    0x09E6: "0", 0x09E7: "1", 0x09E8: "2", 0x09E9: "3", 0x09EA: "4",
+    0x09EB: "5", 0x09EC: "6", 0x09ED: "7", 0x09EE: "8", 0x09EF: "9",
+    # Devanagari ०-९
+    0x0966: "0", 0x0967: "1", 0x0968: "2", 0x0969: "3", 0x096A: "4",
+    0x096B: "5", 0x096C: "6", 0x096D: "7", 0x096E: "8", 0x096F: "9",
+    # Arabic-Indic ٠-٩
+    0x0660: "0", 0x0661: "1", 0x0662: "2", 0x0663: "3", 0x0664: "4",
+    0x0665: "5", 0x0666: "6", 0x0667: "7", 0x0668: "8", 0x0669: "9",
+}
+
+
+def normalize_ascii_digits(text: str) -> str:
+    """Ensure all numeric characters are normalized to standard ASCII '0'-'9'."""
+    return text.translate(_VERNACULAR_DIGITS)
+
+
+def find_tags(text: str) -> list[str]:
+    """Find placeholder tags like {0}, { 1 }, {name}, or HTML tags in text."""
+    return _TAG_PATTERN.findall(text)
+
+
+def check_tags_preserved(source: str, translation: str) -> tuple[bool, str | None]:
+    """Check that all placeholder tags in source text exist in translation. Returns (ok, missing_tag)."""
+    tags = find_tags(source)
+    for tag in tags:
+        if tag not in translation:
+            return False, tag
+    return True, None
+
+
 def _hard_split(piece: str, size: int) -> list[str]:
     if len(piece) <= size:
         return [piece]

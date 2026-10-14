@@ -14,7 +14,7 @@ TOKEN = "a-long-random-secret-1234"
 class ConfigTests(unittest.TestCase):
     def test_defaults(self):
         s = Settings.from_env({"API_TOKEN": TOKEN})
-        self.assertEqual(s.engine_order, ("google_web", "mymemory", "google_gtx"))
+        self.assertEqual(s.engine_order, ("gemini", "cloudflare", "mymemory"))
         self.assertEqual(s.max_segments, 10)
         self.assertTrue(s.allow_localhost)
         self.assertFalse(s.enable_docs)

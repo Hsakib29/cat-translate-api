@@ -30,7 +30,7 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
     settings = settings or Settings.from_env()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     socket.setdefaulttimeout(settings.engine_timeout_seconds + 10)  # safety net for libraries with no timeout
-    pipe = pipeline or Pipeline(build_engines(), settings)
+    pipe = pipeline or Pipeline(build_engines(settings), settings)
 
     app = FastAPI(
         title="CAT Translate API",
