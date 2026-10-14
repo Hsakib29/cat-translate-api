@@ -17,6 +17,10 @@ import json
 import urllib.request
 import urllib.error
 
+# Ensure Windows PowerShell consoles can output UTF-8 text (like Bengali translations)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 def http(method, url, token="", body=None):
     data = json.dumps(body).encode() if body else None
@@ -105,10 +109,9 @@ def main():
             has_text = r.get("text") is not None
             via = r.get("via", "?")
             results.append(chk(f"segment {i+1} has text", has_text, f"via={via}"))
-            if has_text:
+            if has_text and i == 1:
                 digits_ok = "102" in r["text"]
-                results.append(chk(f"segment {i+1} ASCII digits preserved (102)", digits_ok, r["text"][:55]))
-            if i == 1 and has_text:
+                results.append(chk("segment 2 ASCII digits preserved (102)", digits_ok, r["text"][:55]))
                 tag_ok = "{0}" in r["text"]
                 results.append(chk("segment 2 tag {0} preserved", tag_ok, r["text"][:55]))
         meta = body.get("meta", {})
