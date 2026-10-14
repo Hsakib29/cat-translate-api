@@ -100,3 +100,10 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
         return {"results": [r.as_dict() for r in results], "meta": meta}
 
     return app
+
+
+def __getattr__(name: str):
+    if name == "app":
+        return create_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
