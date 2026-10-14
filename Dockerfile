@@ -13,4 +13,4 @@ USER appuser
 
 EXPOSE 10000
 # One worker on purpose: the "one request at a time" queue lives inside this process.
-CMD ["sh", "-c", "exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]
+CMD exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port ${PORT:-10000} --workers 1
