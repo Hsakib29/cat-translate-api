@@ -57,6 +57,10 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
         if not good:
             raise HTTPException(401, "Invalid or missing token.", headers={"WWW-Authenticate": "Bearer"})
 
+    @app.get("/")
+    def read_root():
+        return {"status": "healthy", "service": "cat-translate-api"}
+
     @app.get("/api/health")
     def health():
         return {"ok": True, "service": "cat-translate-api", "version": __version__}
