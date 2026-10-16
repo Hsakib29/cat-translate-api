@@ -6,6 +6,7 @@ import secrets
 import socket
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -44,7 +45,7 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
         CORSMiddleware,
         allow_origins=origins,
         allow_origin_regex=origin_regex,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "HEAD"],
         allow_headers=["Authorization", "Content-Type"],
         max_age=600,
     )
@@ -57,9 +58,9 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
         if not good:
             raise HTTPException(401, "Invalid or missing token.", headers={"WWW-Authenticate": "Bearer"})
 
-    @app.get("/")
-    def read_root():
-        return {"status": "healthy", "service": "cat-translate-api"}
+    @app.api_route("/", methods=["GET", "HEAD"])
+    async def read_root(request: Request):
+        return JSONResponse({"status": "healthy", "service": "cat-translate-api"})
 
     @app.get("/api/health")
     def health():
