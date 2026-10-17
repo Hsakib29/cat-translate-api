@@ -37,11 +37,7 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
     pipe = pipeline or Pipeline(build_engines(settings), settings)
 
     worker_daemon = None
-    autostart_env = os.environ.get("WORKER_AUTOSTART", "").lower()
-    should_autostart = autostart_env in ("true", "1", "yes") or (
-        bool(os.environ.get("WORKER_API_KEY")) and autostart_env not in ("false", "0", "no")
-    )
-    if should_autostart:
+    if os.environ.get("WORKER_AUTOSTART", "").lower() in ("true", "1", "yes"):
         try:
             from .worker import WorkerConfig, WorkerDaemon
             config = WorkerConfig.from_env()
@@ -92,12 +88,7 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
 
     @app.get("/api/health")
     def health():
-        return {
-            "ok": True,
-            "service": "cat-translate-api",
-            "version": __version__,
-            "worker_active": bool(worker_daemon and worker_daemon.is_running),
-        }
+        return {"ok": True, "service": "cat-translate-api", "version": __version__}
 
     @app.get("/api/engines", dependencies=[Depends(require_token)])
     def engines():
