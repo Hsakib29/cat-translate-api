@@ -121,3 +121,29 @@ def chunk_text(text: str, size: int) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def normalize_text(text: str) -> str:
+    """Normalize text for TM exact-match lookup.
+    
+    Matches browser's norm() behavior from src/translator/lib/docx.js:
+    - NFC unicode normalization
+    - Remove zero-width space (U+200B) and BOM (U+FEFF)
+    - Collapse whitespace to single spaces
+    - Trim leading/trailing whitespace
+    
+    Args:
+        text: Raw source text to normalize.
+        
+    Returns:
+        Normalized text suitable for TM dictionary lookup.
+    """
+    import unicodedata
+    
+    # NFC normalization
+    norm = unicodedata.normalize("NFC", text)
+    # Remove zero-width space and BOM
+    norm = norm.replace("\u200B", "").replace("\uFEFF", "")
+    # Collapse whitespace and trim
+    norm = " ".join(norm.split()).strip()
+    return norm

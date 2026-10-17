@@ -182,6 +182,50 @@ class LovableWorkerClient:
                         result[str(src).strip()] = str(tgt).strip()
         return result
 
+    @staticmethod
+    def _parse_tm_payload(raw: Any) -> Dict[str, str]:
+        """Normalizes Translation Memory payloads into {normalized_source: target_translation}.
+
+        Matches browser's normalizeMem behavior:
+        - Keys are normalized (NFC unicode, zero-width removal, whitespace collapse, trim)
+        - Values must be non-empty strings
+        - Duplicate normalized keys deduplicate (last wins, matching browser behavior)
+
+        Supports:
+        - Direct map: {"source": "target"}
+        - List of dicts: [{"src": "source", "tgt": "target"}]
+        - Nested in cat_projects structure: {"tm": {...}}
+        """
+        import unicodedata
+
+        result: Dict[str, str] = {}
+
+        # Extract raw TM if nested
+        if isinstance(raw, dict) and "tm" in raw:
+            raw = raw["tm"]
+
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, str) and v.strip():
+                    # Normalize key: NFC, remove ZWSP/BOM, collapse whitespace, trim
+                    norm_key = unicodedata.normalize("NFC", str(k))
+                    norm_key = norm_key.replace("\u200B", "").replace("\uFEFF", "")
+                    norm_key = " ".join(norm_key.split()).strip()
+                    if norm_key:
+                        result[norm_key] = v.strip()
+        elif isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    src = item.get("src") or item.get("source")
+                    tgt = item.get("tgt") or item.get("target") or item.get("translation")
+                    if src and tgt and isinstance(tgt, str) and tgt.strip():
+                        norm_key = unicodedata.normalize("NFC", str(src))
+                        norm_key = norm_key.replace("\u200B", "").replace("\uFEFF", "")
+                        norm_key = " ".join(norm_key.split()).strip()
+                        if norm_key:
+                            result[norm_key] = tgt.strip()
+        return result
+
     def _fetch_glossary_from_supabase(
         self, project_id: Optional[str], user_id: Optional[str]
     ) -> Dict[str, str]:
@@ -212,6 +256,144 @@ class LovableWorkerClient:
         except Exception as exc:
             log.warning("Direct Supabase glossary query failed: %s", exc)
         return {}
+
+    def get_tm(
+        self,
+        job_id: str,
+        project_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Fetches Translation Memory for the job's project.
+
+        Checks GET /tm on the Lovable server first, then falls back to direct Supabase query.
+        Returns a normalized dict {normalized_source: target_translation}.
+        """
+        try:
+            params: Dict[str, str] = {"job_id": job_id}
+            if project_id:
+                params["project_id"] = project_id
+            if user_id:
+                params["user_id"] = user_id
+            resp = self.client.get("/tm", params=params)
+            if resp.status_code == 200:
+                raw = resp.json().get("tm", {})
+                return self._parse_tm_payload(raw)
+        except Exception as exc:
+            log.warning("Could not fetch TM via API for Job %s: %s", job_id, exc)
+
+        if self.config.supabase_url and self.config.supabase_key:
+            return self._fetch_tm_from_supabase(project_id, user_id)
+
+        return {}
+
+    def _fetch_tm_from_supabase(
+        self, project_id: Optional[str], user_id: Optional[str]
+    ) -> Dict[str, str]:
+        """Direct fallback query to Supabase REST endpoint (cat_projects table)."""
+        try:
+            headers = {
+                "apikey": self.config.supabase_key,
+                "Authorization": f"Bearer {self.config.supabase_key}",
+                "Accept": "application/json",
+            }
+            url = f"{self.config.supabase_url.rstrip('/')}/rest/v1/cat_projects"
+            params: Dict[str, str] = {"select": "tm,project"}
+            if project_id:
+                params["id"] = f"eq.{project_id}"
+            elif user_id:
+                params["user_id"] = f"eq.{user_id}"
+            else:
+                return {}
+
+            resp = httpx.get(url, headers=headers, params=params, timeout=10.0)
+            if resp.status_code == 200:
+                rows = resp.json()
+                if rows and isinstance(rows, list):
+                    first = rows[0]
+                    tm_data = first.get("tm") or first.get("project", {}).get("tm")
+                    if tm_data:
+                        return self._parse_tm_payload(tm_data)
+        except Exception as exc:
+            log.warning("Direct Supabase TM query failed: %s", exc)
+        return {}
+
+    def update_tm(
+        self,
+        project_id: str,
+        tm_updates: Dict[str, str],
+    ) -> bool:
+        """Updates project Translation Memory with new source→target pairs.
+
+        Merges new entries into existing TM (overwrites duplicates).
+        Attempts API endpoint first, falls back to direct Supabase update.
+
+        Args:
+            project_id: Project UUID to update.
+            tm_updates: Dictionary of normalized_source → target_translation to add/merge.
+
+        Returns:
+            True if update succeeded, False otherwise.
+        """
+        if not project_id or not tm_updates:
+            return False
+
+        try:
+            resp = self.client.post(
+                "/tm",
+                json={"project_id": project_id, "tm_updates": tm_updates}
+            )
+            if resp.status_code == 200:
+                return True
+        except Exception as exc:
+            log.warning("Could not update TM via API for project %s: %s", project_id, exc)
+
+        if self.config.supabase_url and self.config.supabase_key:
+            return self._update_tm_via_supabase(project_id, tm_updates)
+
+        return False
+
+    def _update_tm_via_supabase(
+        self, project_id: str, tm_updates: Dict[str, str]
+    ) -> bool:
+        """Direct Supabase REST update fallback for TM."""
+        try:
+            headers = {
+                "apikey": self.config.supabase_key,
+                "Authorization": f"Bearer {self.config.supabase_key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            url = f"{self.config.supabase_url.rstrip('/')}/rest/v1/cat_projects"
+            params: Dict[str, str] = {"id": f"eq.{project_id}"}
+
+            # First, fetch existing TM
+            resp = httpx.get(url, headers=headers, params=params, timeout=10.0)
+            if resp.status_code != 200:
+                return False
+
+            rows = resp.json()
+            if not rows or not isinstance(rows, list):
+                return False
+
+            existing_tm = rows[0].get("tm", {})
+            if not isinstance(existing_tm, dict):
+                existing_tm = {}
+
+            # Merge new entries (overwrite duplicates)
+            merged_tm = {**existing_tm, **tm_updates}
+
+            # Update via PATCH
+            resp = httpx.patch(
+                url,
+                headers=headers,
+                params=params,
+                json={"tm": merged_tm},
+                timeout=10.0
+            )
+            return resp.status_code in (200, 204)
+        except Exception as exc:
+            log.warning("Direct Supabase TM update failed: %s", exc)
+        return False
 
     def upload_translated_file(
         self, user_id: str, job_id: str, filename: str, docx_bytes: bytes
@@ -248,7 +430,7 @@ class LovableWorkerClient:
 
 import docx
 from .doc_processor import extract_segments_from_docx, is_bilingual_table, reconstruct_docx
-from .textutils import to_bn_digits
+from .textutils import to_bn_digits, normalize_text
 from .utils.glossary import protect_terms, restore_terms
 
 
@@ -298,9 +480,24 @@ class JobProcessor:
         if glossary:
             log.info("Job %s: Loaded %d custom glossary terms for translation.", job_id, len(glossary))
 
+        # Retrieve and attach project Translation Memory to job context
+        raw_tm = job.get("tm")
+        if raw_tm:
+            tm = LovableWorkerClient._parse_tm_payload(raw_tm)
+        elif project_id or (self.api.config.supabase_url and self.api.config.supabase_key):
+            tm = self.api.get_tm(job_id=job_id, project_id=project_id, user_id=user_id)
+        else:
+            tm = {}
+        job["tm"] = tm
+        if tm:
+            log.info("Job %s: Loaded %d Translation Memory entries for exact-match lookup.", job_id, len(tm))
+
         source_to_target: Dict[str, str] = {}
         index_to_target: Dict[int, str] = {}
         processed_count = 0
+        tm_hit_count = 0
+        pipeline_count = 0
+        tm_writeback_pairs: Dict[str, str] = {}  # normalized_source → target for TM write-back
         total_chunks = 0
         failed_chunks = 0
 
@@ -325,10 +522,41 @@ class JobProcessor:
                 for chunk in chunks:
                     total_chunks += 1
 
-                    # Protect glossary terms before submitting chunk to pipeline
+                    # First pass: exact TM lookup for each segment
+                    tm_hits: List[Dict[str, Any]] = []  # Segments with TM matches
+                    pipeline_candidates: List[Dict[str, Any]] = []  # Segments needing MT
+                    pipeline_indices: List[int] = []  # Track original indices for pipeline results
+
+                    for idx, seg in enumerate(chunk):
+                        raw_src = seg.get("source_text", "")
+                        norm_src = normalize_text(raw_src)
+
+                        # Check for exact TM match
+                        if norm_src in tm:
+                            target_text = tm[norm_src]
+                            # Apply digit localization for Bengali target language
+                            if is_bn:
+                                target_text = to_bn_digits(target_text)
+
+                            tm_hits.append({
+                                "index": idx,
+                                "id": seg["id"],
+                                "target_text": target_text,
+                                "status": "tm",
+                            })
+                            tm_hit_count += 1
+                            log.debug("Job %s: TM exact match for segment %s: '%s' -> '%s'",
+                                    job_id, seg.get("id"), raw_src[:50], target_text[:50])
+                        else:
+                            # No TM match: add to pipeline batch
+                            pipeline_candidates.append(seg)
+                            pipeline_indices.append(idx)
+
+                    # Second pass: glossary protection and pipeline translation for non-TM segments
                     chunk_source_texts: List[str] = []
                     chunk_token_maps: List[Dict[str, str]] = []
-                    for seg in chunk:
+
+                    for seg in pipeline_candidates:
                         raw_src = seg.get("source_text", "")
                         if glossary:
                             prot_text, tok_map = protect_terms(raw_src, glossary)
@@ -340,63 +568,86 @@ class JobProcessor:
                     # Chunk translation with retry and error isolation
                     results = None
                     last_chunk_err = None
-                    for attempt in range(self.max_chunk_retries + 1):
-                        try:
-                            results, _meta = self.pipeline.run_batch(chunk_source_texts, sl=sl, tl=tl)
-                            break
-                        except Exception as err:
-                            last_chunk_err = err
-                            log.warning(
-                                "Job %s: Chunk %d (size=%d) translation attempt %d failed: %s",
-                                job_id, total_chunks, len(chunk), attempt + 1, err
-                            )
-                            if attempt < self.max_chunk_retries:
-                                time.sleep(1.0 * (attempt + 1))
 
-                    # Clean response parsing: map strictly back to database rows and indices
-                    chunk_submission = []
+                    # Only run pipeline if there are candidates
+                    if pipeline_candidates:
+                        for attempt in range(self.max_chunk_retries + 1):
+                            try:
+                                results, _meta = self.pipeline.run_batch(chunk_source_texts, sl=sl, tl=tl)
+                                break
+                            except Exception as err:
+                                last_chunk_err = err
+                                log.warning(
+                                    "Job %s: Chunk %d (size=%d) translation attempt %d failed: %s",
+                                    job_id, total_chunks, len(pipeline_candidates), attempt + 1, err
+                                )
+                                if attempt < self.max_chunk_retries:
+                                    time.sleep(1.0 * (attempt + 1))
+
+                    # Merge TM hits and pipeline results into submission in original order
+                    chunk_submission: List[Dict[str, Any]] = []
+                    pipeline_result_idx = 0  # Track position in pipeline results
+
                     for idx, seg in enumerate(chunk):
-                        res = results[idx] if (results and idx < len(results)) else None
-                        tok_map = chunk_token_maps[idx] if idx < len(chunk_token_maps) else {}
+                        # Check if this segment was a TM hit
+                        tm_hit = next((hit for hit in tm_hits if hit["index"] == idx), None)
 
-                        if res and res.text is not None:
-                            target_text = restore_terms(res.text, tok_map) if tok_map else res.text
+                        if tm_hit:
+                            # Use TM result directly
+                            chunk_submission.append({
+                                "id": tm_hit["id"],
+                                "target_text": tm_hit["target_text"],
+                                "status": tm_hit["status"],
+                            })
                         else:
-                            # Per-segment isolated fallback: if batch failed or segment was omitted,
-                            # attempt single-segment translation with glossary protection
-                            source_text = seg.get("source_text", "")
-                            target_text = None
-                            if len(chunk) > 1 and source_text.strip():
-                                try:
-                                    prot_single, single_map = (
-                                        protect_terms(source_text, glossary) if glossary else (source_text, {})
-                                    )
-                                    single_res, _ = self.pipeline.run_batch([prot_single], sl=sl, tl=tl)
-                                    if single_res and single_res[0].text is not None:
-                                        target_text = (
-                                            restore_terms(single_res[0].text, single_map)
-                                            if single_map
-                                            else single_res[0].text
+                            # Use pipeline result
+                            res = results[pipeline_result_idx] if (results and pipeline_result_idx < len(results)) else None
+                            tok_map = chunk_token_maps[pipeline_result_idx] if pipeline_result_idx < len(chunk_token_maps) else {}
+                            pipeline_result_idx += 1
+
+                            if res and res.text is not None:
+                                target_text = restore_terms(res.text, tok_map) if tok_map else res.text
+                            else:
+                                # Per-segment isolated fallback: if batch failed or segment was omitted,
+                                # attempt single-segment translation with glossary protection
+                                source_text = seg.get("source_text", "")
+                                target_text = None
+                                if len(pipeline_candidates) > 1 and source_text.strip():
+                                    try:
+                                        prot_single, single_map = (
+                                            protect_terms(source_text, glossary) if glossary else (source_text, {})
                                         )
-                                except Exception as seg_err:
-                                    log.warning(
-                                        "Job %s: Per-segment fallback for segment %s failed: %s",
-                                        job_id, seg.get("id"), seg_err
-                                    )
-                            if target_text is None:
-                                target_text = source_text
+                                        single_res, _ = self.pipeline.run_batch([prot_single], sl=sl, tl=tl)
+                                        if single_res and single_res[0].text is not None:
+                                            target_text = (
+                                                restore_terms(single_res[0].text, single_map)
+                                                if single_map
+                                                else single_res[0].text
+                                            )
+                                    except Exception as seg_err:
+                                        log.warning(
+                                            "Job %s: Per-segment fallback for segment %s failed: %s",
+                                            job_id, seg.get("id"), seg_err
+                                        )
+                                if target_text is None:
+                                    target_text = source_text
 
-                        status = "translated"
+                            status = "translated"
 
-                        # Apply digit localization for Bengali target language
-                        if is_bn:
-                            target_text = to_bn_digits(target_text)
+                            # Apply digit localization for Bengali target language
+                            if is_bn:
+                                target_text = to_bn_digits(target_text)
 
-                        chunk_submission.append({
-                            "id": seg["id"],
-                            "target_text": target_text,
-                            "status": status,
-                        })
+                            chunk_submission.append({
+                                "id": seg["id"],
+                                "target_text": target_text,
+                                "status": status,
+                            })
+
+                            # Track for TM write-back (use normalized source as key)
+                            norm_src = normalize_text(seg.get("source_text", ""))
+                            tm_writeback_pairs[norm_src] = target_text
+                            pipeline_count += 1
 
                         clean_source = seg.get("source_text", "").strip()
                         if clean_source:
@@ -407,7 +658,15 @@ class JobProcessor:
                             except (ValueError, TypeError):
                                 pass
 
-                    if results is None:
+                    # Log TM hit rate for this chunk
+                    if tm_hits:
+                        log.info(
+                            "Job %s: Chunk %d - TM hits: %d/%d (%.1f%%), pipeline: %d",
+                            job_id, total_chunks, len(tm_hits), len(chunk),
+                            len(tm_hits) / len(chunk) * 100, len(pipeline_candidates)
+                        )
+
+                    if results is None and pipeline_candidates:
                         failed_chunks += 1
                         log.warning(
                             "Job %s: Chunk %d batch attempt failed (%s); executed per-segment recovery.",
@@ -483,9 +742,30 @@ class JobProcessor:
 
             # 4. Mark job completed
             self.api.update_job_status(job_id, status="completed", translated_file_path=translated_path)
+
+            # 5. Write back new translations to project TM (if applicable)
+            if project_id and tm_writeback_pairs:
+                try:
+                    updated = self.api.update_tm(project_id, tm_writeback_pairs)
+                    if updated:
+                        log.info(
+                            "Job %s: TM write-back successful - added/updated %d entries to project %s",
+                            job_id, len(tm_writeback_pairs), project_id
+                        )
+                    else:
+                        log.warning(
+                            "Job %s: TM write-back failed for project %s (%d entries)",
+                            job_id, project_id, len(tm_writeback_pairs)
+                        )
+                except Exception as tm_err:
+                    log.warning("Job %s: TM write-back error: %s", job_id, tm_err)
+
+            # 6. Log comprehensive job summary
             log.info(
-                "Job %s successfully COMPLETED. (Total segments: %d, chunks: %d, recovered failures: %d)",
-                job_id, processed_count, total_chunks, failed_chunks
+                "Job %s successfully COMPLETED. (Total: %d, TM hits: %d (%.1f%%), MT pipeline: %d (%.1f%%), chunks: %d, recovered failures: %d)",
+                job_id, processed_count, tm_hit_count, (tm_hit_count / processed_count * 100 if processed_count else 0),
+                pipeline_count, (pipeline_count / processed_count * 100 if processed_count else 0),
+                total_chunks, failed_chunks
             )
 
         except Exception as exc:

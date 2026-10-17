@@ -398,6 +398,240 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("নিরাপত্তা সমন্বয়কারী", saved_target)
         self.assertIn("নিরাপত্তা নির্দেশিকা", saved_target)
 
+    def test_job_processor_uses_tm_exact_match(self):
+        """Test that exact TM matches bypass pipeline and glossary protection."""
+        mock_http = MagicMock()
+        pending_segments = [
+            {"id": "seg-1", "segment_index": 0, "source_text": "Hello world"},
+            {"id": "seg-2", "segment_index": 1, "source_text": "New segment without TM"},
+            {"id": "seg-3", "segment_index": 2, "source_text": "Second paragraph"},
+        ]
+        mock_http.get.side_effect = [
+            fake_resp(200, json={"segments": pending_segments}),
+            fake_resp(200, json={"segments": []}),
+        ]
+        mock_http.post.return_value = fake_resp(200, json={"ok": True})
+
+        client = LovableWorkerClient(self.config, client=mock_http)
+        mock_pipeline = MagicMock()
+
+        received_batch_texts = []
+
+        def fake_run_batch(texts, sl="en", tl="bn"):
+            received_batch_texts.extend(texts)
+            from app.pipeline import Result
+            return [Result(text="অনূদিত বাক্য")], {}
+
+        mock_pipeline.run_batch.side_effect = fake_run_batch
+
+        processor = JobProcessor(client, mock_pipeline, batch_size=10, chunk_size=5)
+        job = {
+            "id": "job-tm-1",
+            "user_id": "user-1",
+            "file_name": "test.docx",
+            "original_file_path": "",
+            "total_segments": 3,
+            "source_language": "en",
+            "target_language": "bn",
+            "tm": {
+                "Hello world": "হ্যালো বিশ্ব",
+                "Second paragraph": "দ্বিতীয় অনুচ্ছেদ",
+            },
+        }
+
+        processor.process(job)
+
+        # Verify pipeline only received the segment without TM match
+        self.assertEqual(len(received_batch_texts), 1)
+        self.assertEqual(received_batch_texts[0], "New segment without TM")
+
+        # Verify submission has correct statuses and translations
+        submission_calls = [
+            call for call in mock_http.post.call_args_list if call[0][0] == "/segments"
+        ]
+        self.assertEqual(len(submission_calls), 1)
+        results = submission_calls[0][1]["json"]["results"]
+
+        # Check TM segments have status "tm" and correct translations
+        tm_results = [r for r in results if r["status"] == "tm"]
+        self.assertEqual(len(tm_results), 2)
+        self.assertEqual(tm_results[0]["target_text"], "হ্যালো বিশ্ব")
+        self.assertEqual(tm_results[1]["target_text"], "দ্বিতীয় অনুচ্ছেদ")
+
+        # Check pipeline segment has status "translated"
+        mt_results = [r for r in results if r["status"] == "translated"]
+        self.assertEqual(len(mt_results), 1)
+        self.assertEqual(mt_results[0]["target_text"], "অনূদিত বাক্য")
+
+    def test_normalize_text_function(self):
+        """Test normalize_text matches browser's norm() behavior."""
+        from app.textutils import normalize_text
+
+        # Whitespace collapse and trim
+        self.assertEqual(normalize_text("  Hello   world  "), "Hello world")
+
+        # Zero-width space removal
+        self.assertEqual(normalize_text("Hello\u200Bworld"), "Helloworld")
+
+        # BOM removal
+        self.assertEqual(normalize_text("\uFEFFHello world"), "Hello world")
+
+        # Combined normalization
+        self.assertEqual(normalize_text("  Hello\u200B   world  "), "Hello world")
+
+        # Empty string
+        self.assertEqual(normalize_text(""), "")
+
+        # Already normalized
+        self.assertEqual(normalize_text("Hello world"), "Hello world")
+
+    def test_update_tm_via_supabase(self):
+        """Test TM update via direct Supabase fallback."""
+        from unittest.mock import patch
+
+        client = LovableWorkerClient(self.config)
+        updates = {"new key": "new target", "existing": "updated target"}
+
+        with patch("app.worker.httpx") as mock_httpx:
+            # Simulate existing TM fetch
+            mock_httpx.get.return_value = fake_resp(200, json=[{"tm": {"existing": "existing target"}}])
+            # Simulate successful update
+            mock_httpx.patch.return_value = fake_resp(200, json={})
+
+            result = client._update_tm_via_supabase("project-123", updates)
+
+            self.assertTrue(result)
+            # Verify PATCH was called with merged TM
+            mock_httpx.patch.assert_called_once()
+            call_args = mock_httpx.patch.call_args
+            merged_tm = call_args[1]["json"]["tm"]
+            self.assertEqual(merged_tm["existing"], "updated target")
+            self.assertEqual(merged_tm["new key"], "new target")
+
+    def test_update_tm_empty_updates(self):
+        """Test TM update with empty updates returns False."""
+        client = LovableWorkerClient(self.config)
+        result = client.update_tm("project-123", {})
+        self.assertFalse(result)
+
+    def test_update_tm_no_project_id(self):
+        """Test TM update without project_id returns False."""
+        client = LovableWorkerClient(self.config)
+        result = client.update_tm("", {"key": "value"})
+        self.assertFalse(result)
+
+    def test_job_processor_tracks_tm_and_pipeline_counts(self):
+        """Test that job processor correctly tracks TM hits vs pipeline translations."""
+        mock_http = MagicMock()
+        pending_segments = [
+            {"id": "seg-1", "segment_index": 0, "source_text": "Hello world"},
+            {"id": "seg-2", "segment_index": 1, "source_text": "New segment"},
+            {"id": "seg-3", "segment_index": 2, "source_text": "Another segment"},
+        ]
+        mock_http.get.side_effect = [
+            fake_resp(200, json={"segments": pending_segments}),
+            fake_resp(200, json={"segments": []}),
+        ]
+        mock_http.post.return_value = fake_resp(200, json={"ok": True})
+
+        client = LovableWorkerClient(self.config, client=mock_http)
+        mock_pipeline = MagicMock()
+
+        received_batch_texts = []
+
+        def fake_run_batch(texts, sl="en", tl="bn"):
+            received_batch_texts.extend(texts)
+            from app.pipeline import Result
+            return [Result(text="অনূদিত বাক্য")], {}
+
+        mock_pipeline.run_batch.side_effect = fake_run_batch
+
+        processor = JobProcessor(client, mock_pipeline, batch_size=10, chunk_size=5)
+        job = {
+            "id": "job-counts-1",
+            "user_id": "user-1",
+            "file_name": "test.docx",
+            "original_file_path": "",
+            "total_segments": 3,
+            "source_language": "en",
+            "target_language": "bn",
+            "tm": {
+                "Hello world": "হ্যালো বিশ্ব",  # This will be a TM hit
+            },
+        }
+
+        processor.process(job)
+
+        # Verify TM hit was NOT sent to pipeline
+        self.assertNotIn("Hello world", received_batch_texts)
+        # Verify the other segments were sent to pipeline
+        self.assertIn("New segment", received_batch_texts)
+        self.assertIn("Another segment", received_batch_texts)
+
+    def test_parse_tm_payload_direct_map(self):
+        """Test TM parsing with direct source->target map."""
+        raw = {
+            "Hello world": "হ্যালো বিশ্ব",
+            "Second paragraph": "দ্বিতীয় অনুচ্ছেদ",
+        }
+        result = LovableWorkerClient._parse_tm_payload(raw)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result["Hello world"], "হ্যালো বিশ্ব")
+        self.assertEqual(result["Second paragraph"], "দ্বিতীয় অনুচ্ছেদ")
+
+    def test_parse_tm_payload_list_format(self):
+        """Test TM parsing with list of dicts format."""
+        raw = [
+            {"src": "Hello world", "tgt": "হ্যালো বিশ্ব"},
+            {"source": "Second paragraph", "target": "দ্বিতীয় অনুচ্ছেদ"},
+        ]
+        result = LovableWorkerClient._parse_tm_payload(raw)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result["Hello world"], "হ্যালো বিশ্ব")
+        self.assertEqual(result["Second paragraph"], "দ্বিতীয় অনুচ্ছেদ")
+
+    def test_parse_tm_payload_normalization(self):
+        """Test TM key normalization (NFC, ZWSP removal, whitespace collapse)."""
+        raw = {
+            "Hello   world": "হ্যালো বিশ্ব",  # Multiple spaces
+            "  Hello  world  ": "হ্যালো বিশ্ব",  # Leading/trailing spaces
+        }
+        result = LovableWorkerClient._parse_tm_payload(raw)
+        # Both should normalize to the same key (last wins per browser behavior)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result["Hello world"], "হ্যালো বিশ্ব")
+
+    def test_parse_tm_payload_zwsp_removal(self):
+        """Test TM key normalization removes zero-width spaces."""
+        raw = {
+            "Hello\u200Bworld": "হ্যালো বিশ্ব",  # Zero-width space in middle
+        }
+        result = LovableWorkerClient._parse_tm_payload(raw)
+        # ZWSP should be removed, resulting in "Helloworld"
+        self.assertEqual(len(result), 1)
+        self.assertIn("Helloworld", result)
+        self.assertEqual(result["Helloworld"], "হ্যালো বিশ্ব")
+
+    def test_parse_tm_payload_nested_structure(self):
+        """Test TM parsing when nested in cat_projects structure."""
+        raw = {"tm": {"Hello world": "হ্যালো বিশ্ব"}}
+        result = LovableWorkerClient._parse_tm_payload(raw)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result["Hello world"], "হ্যালো বিশ্ব")
+
+    def test_parse_tm_payload_empty_and_invalid(self):
+        """Test TM parsing with empty/invalid entries."""
+        raw = {
+            "": "target",  # Empty key
+            "source": "",  # Empty value
+            "   ": "target",  # Whitespace-only key
+            "source": "   ",  # Whitespace-only value
+            "valid": "valid target",
+        }
+        result = LovableWorkerClient._parse_tm_payload(raw)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result["valid"], "valid target")
+
 
 if __name__ == "__main__":
     unittest.main()
