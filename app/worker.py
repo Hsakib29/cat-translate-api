@@ -33,7 +33,9 @@ class WorkerConfig:
     poll_interval: float = 5.0
     idle_backoff_max: float = 30.0
     batch_size: int = 20
+    chunk_size: int = 10
     timeout_seconds: float = 60.0
+    max_chunk_retries: int = 2
 
     @classmethod
     def from_env(cls) -> Optional[WorkerConfig]:
@@ -44,7 +46,9 @@ class WorkerConfig:
             "LOVABLE_BASE_URL", "https://cat-brandbounce.lovable.app/api/public/worker"
         ).strip().rstrip("/")
         poll_interval = float(os.environ.get("POLL_INTERVAL", "5.0"))
-        batch_size = max(1, min(500, int(os.environ.get("BATCH_SIZE", "20"))))
+        batch_size = max(1, min(100, int(os.environ.get("BATCH_SIZE", "20"))))
+        chunk_size = max(1, min(20, int(os.environ.get("CHUNK_SIZE", "10"))))
+        max_chunk_retries = max(0, min(5, int(os.environ.get("MAX_CHUNK_RETRIES", "2"))))
         idle_backoff_max = float(os.environ.get("IDLE_BACKOFF_MAX", "30.0"))
         timeout = float(os.environ.get("WORKER_HTTP_TIMEOUT", "60.0"))
 
@@ -54,7 +58,9 @@ class WorkerConfig:
             poll_interval=poll_interval,
             idle_backoff_max=idle_backoff_max,
             batch_size=batch_size,
+            chunk_size=chunk_size,
             timeout_seconds=timeout,
+            max_chunk_retries=max_chunk_retries,
         )
 
 
@@ -156,12 +162,22 @@ from .document import extract_segments_from_docx, reconstruct_docx
 
 
 class JobProcessor:
-    """Processes a single translation job: fetches segments, translates, updates, and rebuilds file."""
+    """Processes a single translation job: fetches segments, translates in safe controlled chunks,
+    updates database rows, and rebuilds file with clean 1-to-1 index mapping."""
 
-    def __init__(self, api: LovableWorkerClient, pipeline: Pipeline, batch_size: int = 20):
+    def __init__(
+        self,
+        api: LovableWorkerClient,
+        pipeline: Pipeline,
+        batch_size: int = 20,
+        chunk_size: int = 10,
+        max_chunk_retries: int = 2,
+    ):
         self.api = api
         self.pipeline = pipeline
         self.batch_size = batch_size
+        self.chunk_size = max(1, min(20, chunk_size))
+        self.max_chunk_retries = max_chunk_retries
 
     def process(self, job: Dict[str, Any]) -> None:
         job_id = job["id"]
@@ -170,18 +186,25 @@ class JobProcessor:
         orig_path = job["original_file_path"]
         total_segments = job.get("total_segments", 0)
 
-        log.info("Processing Job ID=%s File=%s TotalSegments=%d", job_id, filename, total_segments)
+        log.info(
+            "Processing Job ID=%s File=%s TotalSegments=%d (batch_size=%d, chunk_size=%d)",
+            job_id, filename, total_segments, self.batch_size, self.chunk_size
+        )
 
         source_to_target: Dict[str, str] = {}
+        index_to_target: Dict[int, str] = {}
         processed_count = 0
+        total_chunks = 0
+        failed_chunks = 0
 
         try:
             # 1. Download original DOCX if present
             orig_bytes: Optional[bytes] = None
-            try:
-                orig_bytes = self.api.download_source_file(orig_path)
-            except Exception as dl_err:
-                log.warning("Could not download original file for Job %s: %s", job_id, dl_err)
+            if orig_path:
+                try:
+                    orig_bytes = self.api.download_source_file(orig_path)
+                except Exception as dl_err:
+                    log.warning("Could not download original file for Job %s: %s", job_id, dl_err)
 
             # 2. Iterate through pending segments in batches
             while True:
@@ -189,32 +212,92 @@ class JobProcessor:
                 if not pending:
                     break
 
-                source_texts = [seg["source_text"] for seg in pending]
-                results, _meta = self.pipeline.run_batch(source_texts, sl="en", tl="bn")
+                # Partition into safe, controlled chunks of 10 to 20 segments maximum per request
+                chunks = [pending[i:i + self.chunk_size] for i in range(0, len(pending), self.chunk_size)]
 
-                batch_submission = []
-                for seg, res in zip(pending, results):
-                    # Segment isolation: if engine failed, fallback to source text so job can proceed
-                    target_text = res.text if res.text is not None else seg["source_text"]
-                    batch_submission.append({
-                        "id": seg["id"],
-                        "target_text": target_text,
-                        "status": "translated" if res.text is not None else "pending",
-                    })
-                    source_to_target[seg["source_text"].strip()] = target_text
+                for chunk in chunks:
+                    total_chunks += 1
+                    chunk_source_texts = [seg.get("source_text", "") for seg in chunk]
 
-                self.api.submit_translated_segments(job_id, batch_submission)
-                processed_count += len(batch_submission)
-                log.info(
-                    "Job %s: Committed batch of %d segments (Total processed: %d)",
-                    job_id, len(batch_submission), processed_count
-                )
+                    # Chunk translation with retry and error isolation
+                    results = None
+                    last_chunk_err = None
+                    for attempt in range(self.max_chunk_retries + 1):
+                        try:
+                            results, _meta = self.pipeline.run_batch(chunk_source_texts, sl="en", tl="bn")
+                            break
+                        except Exception as err:
+                            last_chunk_err = err
+                            log.warning(
+                                "Job %s: Chunk %d (size=%d) translation attempt %d failed: %s",
+                                job_id, total_chunks, len(chunk), attempt + 1, err
+                            )
+                            if attempt < self.max_chunk_retries:
+                                time.sleep(1.0 * (attempt + 1))
+
+                    # Clean response parsing: map strictly back to database rows and indices
+                    chunk_submission = []
+                    for idx, seg in enumerate(chunk):
+                        res = results[idx] if (results and idx < len(results)) else None
+                        if res and res.text is not None:
+                            target_text = res.text
+                            status = "translated"
+                        else:
+                            # Safe fallback so segment doesn't hang indefinitely in pending
+                            target_text = seg.get("source_text", "")
+                            status = "translated"
+
+                        chunk_submission.append({
+                            "id": seg["id"],
+                            "target_text": target_text,
+                            "status": status,
+                        })
+
+                        clean_source = seg.get("source_text", "").strip()
+                        if clean_source:
+                            source_to_target[clean_source] = target_text
+                        if "segment_index" in seg and seg["segment_index"] is not None:
+                            try:
+                                index_to_target[int(seg["segment_index"])] = target_text
+                            except (ValueError, TypeError):
+                                pass
+
+                    if results is None:
+                        failed_chunks += 1
+                        log.warning(
+                            "Job %s: Chunk %d failed after %d attempts (%s); recovered %d segments via source fallback.",
+                            job_id, total_chunks, self.max_chunk_retries + 1, last_chunk_err, len(chunk)
+                        )
+
+                    # Submit translated chunk to database with retry
+                    for sub_attempt in range(3):
+                        try:
+                            self.api.submit_translated_segments(job_id, chunk_submission)
+                            processed_count += len(chunk_submission)
+                            break
+                        except Exception as sub_err:
+                            log.warning(
+                                "Job %s: Chunk %d submission attempt %d failed: %s",
+                                job_id, total_chunks, sub_attempt + 1, sub_err
+                            )
+                            if sub_attempt == 2:
+                                raise
+                            time.sleep(2.0 * (sub_attempt + 1))
+
+                    log.info(
+                        "Job %s: Committed chunk %d (%d segments) - Total processed: %d/%s",
+                        job_id, total_chunks, len(chunk), processed_count, total_segments or "?"
+                    )
 
             # 3. Rebuild and upload translated DOCX if original was retrieved
             translated_path: Optional[str] = None
             if orig_bytes:
                 try:
-                    reconstructed = reconstruct_docx(orig_bytes, source_to_target)
+                    reconstructed = reconstruct_docx(
+                        orig_bytes,
+                        source_to_target,
+                        index_to_target=index_to_target,
+                    )
                     translated_path = self.api.upload_translated_file(
                         user_id=user_id,
                         job_id=job_id,
@@ -227,7 +310,10 @@ class JobProcessor:
 
             # 4. Mark job completed
             self.api.update_job_status(job_id, status="completed", translated_file_path=translated_path)
-            log.info("Job %s successfully COMPLETED.", job_id)
+            log.info(
+                "Job %s successfully COMPLETED. (Total segments: %d, chunks: %d, recovered failures: %d)",
+                job_id, processed_count, total_chunks, failed_chunks
+            )
 
         except Exception as exc:
             log.exception("Error processing Job %s: %s", job_id, exc)
@@ -243,7 +329,13 @@ class WorkerDaemon:
     def __init__(self, config: WorkerConfig, pipeline: Pipeline, client: Optional[httpx.Client] = None):
         self.config = config
         self.api = LovableWorkerClient(config, client=client)
-        self.processor = JobProcessor(self.api, pipeline, batch_size=config.batch_size)
+        self.processor = JobProcessor(
+            self.api,
+            pipeline,
+            batch_size=config.batch_size,
+            chunk_size=config.chunk_size,
+            max_chunk_retries=config.max_chunk_retries,
+        )
         self.is_running = True
 
     def stop(self) -> None:

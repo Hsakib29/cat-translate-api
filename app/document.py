@@ -9,7 +9,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 import zipfile
-from typing import Any, BinaryIO, Dict, Iterator, List, Set, Union
+from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Set, Union
 
 import docx
 from docx.document import Document as DocxDocument
@@ -121,17 +121,28 @@ def update_paragraph_text(p: Paragraph, translated_text: str) -> None:
         r.text = ""
 
 
-def reconstruct_docx(docx_bytes: bytes, translations: Dict[str, str]) -> bytes:
+def reconstruct_docx(
+    docx_bytes: bytes,
+    translations: Dict[str, str],
+    index_to_target: Optional[Dict[int, str]] = None,
+) -> bytes:
     """Replaces text in a DOCX document with translated text.
     Handles multi-paragraph table cells explicitly via cell.paragraphs,
     preserving list bullets, styles, runs, and document structure.
+    If index_to_target is provided, maps each translatable paragraph 1-to-1 by document index.
     """
     try:
         doc = docx.Document(io.BytesIO(docx_bytes))
+        seg_index = 0
         for p in iter_document_paragraphs(doc):
             source = p.text.strip()
-            if source and source in translations:
+            if not is_translatable(source):
+                continue
+            if index_to_target is not None and seg_index in index_to_target:
+                update_paragraph_text(p, index_to_target[seg_index])
+            elif source in translations:
                 update_paragraph_text(p, translations[source])
+            seg_index += 1
 
         out_buf = io.BytesIO()
         doc.save(out_buf)
@@ -139,10 +150,14 @@ def reconstruct_docx(docx_bytes: bytes, translations: Dict[str, str]) -> bytes:
 
     except Exception as exc:
         log.warning("python-docx reconstruction failed (%s), falling back to XML stream replacement", exc)
-        return _reconstruct_docx_xml_fallback(docx_bytes, translations)
+        return _reconstruct_docx_xml_fallback(docx_bytes, translations, index_to_target=index_to_target)
 
 
-def _reconstruct_docx_xml_fallback(docx_bytes: bytes, translations: Dict[str, str]) -> bytes:
+def _reconstruct_docx_xml_fallback(
+    docx_bytes: bytes,
+    translations: Dict[str, str],
+    index_to_target: Optional[Dict[int, str]] = None,
+) -> bytes:
     """Fallback XML rebuilder for minimal non-OPC zip archives or corrupted packages."""
     in_buf = io.BytesIO(docx_bytes)
     out_buf = io.BytesIO()
@@ -153,16 +168,24 @@ def _reconstruct_docx_xml_fallback(docx_bytes: bytes, translations: Dict[str, st
             if item.filename == "word/document.xml":
                 try:
                     tree = ET.fromstring(data)
+                    seg_index = 0
                     for p in tree.iter(f"{{{W_NS}}}p"):
                         p_texts = [node.text for node in p.iter(f"{{{W_NS}}}t") if node.text]
                         combined = "".join(p_texts).strip()
-                        if combined and combined in translations:
+                        if not is_translatable(combined):
+                            continue
+                        target = None
+                        if index_to_target is not None and seg_index in index_to_target:
+                            target = index_to_target[seg_index]
+                        elif combined in translations:
                             target = translations[combined]
+                        if target is not None:
                             t_nodes = list(p.iter(f"{{{W_NS}}}t"))
                             if t_nodes:
                                 t_nodes[0].text = target
                                 for remaining in t_nodes[1:]:
                                     remaining.text = ""
+                        seg_index += 1
                     data = ET.tostring(tree, encoding="utf-8", xml_declaration=True)
                 except Exception as xml_exc:
                     log.warning("Fallback XML reconstruction warning: %s", xml_exc)

@@ -1,163 +1,238 @@
-# CAT Translate API
+# CAT Translate API & Cloud Translation Worker
 
-A small private translation service for your CAT tool. It takes text segments, translates them one request at a time through a chain of engines, and tells you which engine answered. It is stateless: glossary, memory and placeholders stay in the CAT tool.
+A high-reliability private translation service and asynchronous document translation worker for Computer-Assisted Translation (CAT) tools.
 
-## How it behaves
+The system operates in two coordinated modes:
+1. **Synchronous REST API**: Fast, single-queue translation API with a multi-engine fallback chain (`gemini` → `cloudflare` → `mymemory`) for live segment translation.
+2. **Asynchronous Cloud Document Worker**: Autonomous background worker daemon that polls the Lovable Cloud API bridge, translates large document segment batches in safe controlled chunks, and reconstructs `.docx` files preserving tables, multi-paragraph cells, and bullet lists.
 
-- **One request at a time.** A single queue handles every call, with a short pause between calls to the same engine. Run it with one worker (the Dockerfile does).
-- **Fallback chain.** Default order: `gemini` (Google Gemini LLM with model cascade), then `cloudflare` (Cloudflare Workers AI), then `mymemory`. If one fails, the next is tried. Each result says which engine answered (`via`).
-- **Cooldown.** A block page or HTTP 429 rests an engine at once. Other failures rest it after 3 in a row. Rests last 5 minutes, then 15, then 60, and a success resets that.
-- **Never freezes.** Every engine call has a timeout, and a request that runs too long hands the remaining segments back with `retryable: true`.
-- **Honest errors.** A failed segment comes back with the reason for every engine tried. A failed segment never fails the whole request.
-- **Private.** Segment text is never written to logs or error messages. It is sent to the engine providers (Google, Cloudflare, MyMemory), so tell clients with confidentiality terms.
-- **Tag & numeral preservation.** CAT placeholders like `{0}` and `{name}` are validated after every translation — a segment that loses a tag is rejected and retried on the next engine. ASCII digits `0-9` are always normalized back from any localized numerals the model may emit.
+---
 
-## Engine chain
+## System Architecture
 
-| Engine | What it is | Default | Notes |
-|---|---|---|---|
-| `gemini` | Google Gemini LLM (`gemini-3.5-flash-lite` → `3.1-flash-lite` → `gemma-4-26b`) | **1st** | Numbered JSON segments, thought-token filtration, 4–5 s pacing. Needs `GEMINI_API_KEY`. |
-| `cloudflare` | Cloudflare Workers AI (`@cf/meta/m2m100-1.2b`) | **2nd** | 100+ languages natively. Needs `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`. |
-| `mymemory` | MyMemory free API via `deep-translator` | **3rd** | 5 k chars/day free; set `MYMEMORY_EMAIL` to lift to 50 k. Long text auto-chunked. |
-| `google_web` | Google Translate via `deep-translator` | Disabled | Legacy scraper. Add to `ENGINE_ORDER` to re-enable. |
-| `google_gtx` | Google's JSON endpoint | Disabled | Legacy scraper; was easily blocked. Add to `ENGINE_ORDER` to re-enable. |
-
-### Gemini model cascade
-
-Inside the `gemini` engine, models are tried in order:
-
-1. `gemini-3.5-flash-lite` (primary)
-2. `gemini-3.1-flash-lite` (secondary)
-3. `gemma-4-26b-a4b-it` (tertiary)
-
-If **all three** fail, the pipeline falls through to `cloudflare`, then `mymemory`.
-
-## Endpoints
-
-All except `/api/health` need `Authorization: Bearer <API_TOKEN>`.
-
-| Endpoint | What it does |
-|---|---|
-| `GET /api/health` | Is the service awake? No token needed, so it also wakes a sleeping Render instance. |
-| `GET /api/engines` | Each engine's status (`ok`, `failing`, `cooldown`, `untested`), last error, cooldown left, counters, and settings. |
-| `GET /api/selftest?sl=en&tl=bn` | Sends two short test sentences through every engine and reports which work from this server's address and whether `{0}` placeholders survive. Limited to once a minute. Add `&force=true` to test an engine that is resting. |
-| `POST /api/translate` | Translate up to 10 segments. |
-
-Request:
-
-```json
-{ "sl": "en", "tl": "bn", "segments": ["Hello, how are you?", "Open {0} now."], "engines": ["gemini", "mymemory"] }
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Lovable Cloud Application                       │
+│  - User uploads DOCX                                                   │
+│  - Document segments extracted & stored in Supabase                    │
+│  - API Bridge Routes: /api/public/worker/(health|claim|segments|file)  │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                       x-worker-api-key Authentication
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   Render: CAT Translate API & Worker                   │
+│                                                                        │
+│   ┌───────────────────────────┐     ┌──────────────────────────────┐   │
+│   │   FastAPI Web Service     │     │   Background Worker Daemon   │   │
+│   │   - GET  /api/health      │     │   - Polls /claim (5s - 30s)  │   │
+│   │   - GET  /api/engines     │     │   - Safe batching (10-20/req)│   │
+│   │   - GET  /api/selftest    │     │   - Chunk retry & isolation  │   │
+│   │   - POST /api/translate   │     │   - Reconstructs DOCX tables │   │
+│   └─────────────┬─────────────┘     └──────────────┬───────────────┘   │
+│                 │                                  │                   │
+│                 └─────────────────┬────────────────┘                   │
+│                                   ▼                                    │
+│                     Translation Engine Pipeline                        │
+│               gemini  ──(fallback)──>  cloudflare  ──>  mymemory        │
+│          (model cascade)           (Workers AI)      (REST API)        │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-`engines` is optional; leave it out to use the default order.
+---
 
-Response:
+## Core System Features & Invariants
 
+- **Safe Controlled Batching**: Translation segments are processed in chunks of 10 to 20 segments maximum per request, preventing engine timeouts and oversized payload rejections.
+- **Chunk Tracking & Failure Isolation**: If an upstream engine encounters an error or timeout during a chunk, the worker retries with backoff. If exhausted, it falls back to source text for that chunk and commits progress, ensuring the job never freezes or leaves segments hanging.
+- **1-to-1 Row & Paragraph Alignment**: Responses are mapped back to their exact Supabase segment IDs and document `segment_index` positions, preventing index drift or phrase collisions.
+- **Multi-Paragraph Table Cell & Bullet Preservation**: The document parser (`app/document.py`) iterates `cell.paragraphs` for every cell in `table.rows` (never flattening `cell.text` or skipping multi-paragraph cells). It updates paragraph runs in-place without corrupting bullet list properties (`w:numPr`) or paragraph styles.
+- **Fallback Chain Continuity**: `gemini` (with 3-model cascade) → `cloudflare` → `mymemory`. If an engine fails, the pipeline transitions seamlessly to the next engine.
+- **Circuit Breaker & Cooldowns**: Immediate trips on bot detection (`blocked`) or HTTP 429 (`rate_limited`). Strike-based trips (3 consecutive errors) trigger stepped backoff (5m → 15m → 60m).
+- **Absolute Privacy**: Segment text is **never** printed to stdout or logged to files or error traces. Error messages are sanitized via `textutils.scrub()`.
+
+---
+
+## Engine Chain
+
+| Engine | Type | Priority | Description & Required Keys |
+|---|---|---|---|
+| `gemini` | Google Gemini LLM | **1st** | Model cascade (`gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemma-4-26b-a4b-it`). Numbered JSON segments, thought-token filtering, tag & digit validation. Needs `GEMINI_API_KEY`. |
+| `cloudflare` | Cloudflare Workers AI | **2nd** | `@cf/meta/m2m100-1.2b` supporting 100+ language pairs natively. Needs `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`. |
+| `mymemory` | MyMemory API | **3rd** | Free translation memory API via `deep-translator`. Optional `MYMEMORY_EMAIL` boosts daily quota from 5k to 50k chars. |
+| `google_web` | Google Scraper | *Disabled* | Legacy scraper; can be enabled in `ENGINE_ORDER` if needed. |
+| `google_gtx` | Google JSON | *Disabled* | Legacy endpoint; can be enabled in `ENGINE_ORDER` if needed. |
+
+---
+
+## Background Worker & Lovable API Bridge
+
+When `WORKER_AUTOSTART=true` or when running `python worker.py`, the worker connects to the Lovable application using the shared `WORKER_API_KEY`.
+
+### Worker Job Lifecycle
+1. **Poll & Claim**: Worker calls `POST /api/public/worker/claim` with `x-worker-api-key`. Atomically claims the oldest `queued` job.
+2. **Download Original File**: Calls `GET /api/public/worker/file?path=...` to download the source `.docx` binary from storage.
+3. **Fetch Pending Segments**: Calls `GET /api/public/worker/segments?job_id=...&limit=20` to fetch uncompleted segments ordered by `segment_index ASC`.
+4. **Controlled Chunk Translation**: Segments are sliced into chunks of `CHUNK_SIZE` (default 10, max 20) and translated via `pipeline.run_batch()`.
+5. **Commit Translated Segments**: Calls `POST /api/public/worker/segments` with `{ id, target_text, status: "translated" }`.
+6. **DOCX Document Reconstruction**: `reconstruct_docx` parses the original `.docx` XML package and updates every body paragraph and table cell paragraph via `index_to_target` and `source_to_target`.
+7. **Upload Translated Document**: Calls `POST /api/public/worker/file` with the reconstructed DOCX bytes.
+8. **Finalize Job Status**: Calls `POST /api/public/worker/status` setting status to `completed` and registering `translated_file_path`.
+
+---
+
+## REST Endpoints
+
+All authenticated endpoints require `Authorization: Bearer <API_TOKEN>`.
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/` | `GET` | None | Service heartbeat check. Returns `{"status": "healthy"}`. |
+| `/api/health` | `GET` | None | Public health check. Wakes sleeping Render instances. |
+| `/api/engines` | `GET` | Bearer | Engine status (`ok`, `cooldown`, etc.), cooldown timers, and statistics. |
+| `/api/selftest` | `GET` | Bearer | Runs test translations through all engines from the current server IP. |
+| `/api/translate` | `POST` | Bearer | Translates a batch of text segments synchronously. |
+
+### POST /api/translate Example
+
+**Request**:
 ```json
 {
-  "results": [
-    { "text": "...", "error": null, "via": "gemini", "cached": false, "retryable": false, "attempts": [] },
-    { "text": null, "error": "gemini: ...; cloudflare: ...", "via": null, "cached": false, "retryable": true,
-      "attempts": [ { "engine": "gemini", "kind": "rate_limited", "message": "..." } ] }
-  ],
-  "meta": { "elapsed_ms": 4820, "queue_wait_ms": 0, "engines": ["gemini", "cloudflare", "mymemory"] }
+  "sl": "en",
+  "tl": "bn",
+  "segments": ["Welcome to our platform.", "Click {0} to proceed."],
+  "engines": ["gemini", "cloudflare"]
 }
 ```
 
-- `via` is an engine name, `"passthrough"` for text with no letters (numbers, punctuation), or the engine that first produced a cached answer.
-- `retryable: true` means trying again later may work (network, block, time limit). `false` means it won't (unsupported language pair, refused input).
-- Error kinds: `blocked`, `rate_limited`, `network`, `empty`, `error`, `unsupported`, `bad_request`, `cooldown`, `deadline`.
-- HTTP codes: 401 bad token, 400 bad input, 413 too big, 429 self-test too soon, 503 busy (retry after a few seconds).
+**Response**:
+```json
+{
+  "results": [
+    {
+      "text": "আমাদের প্ল্যাটফর্মে স্বাগতম।",
+      "error": null,
+      "via": "gemini",
+      "cached": false,
+      "retryable": false,
+      "attempts": []
+    },
+    {
+      "text": "এগিয়ে যেতে {0} এ ক্লিক করুন।",
+      "error": null,
+      "via": "gemini",
+      "cached": false,
+      "retryable": false,
+      "attempts": []
+    }
+  ],
+  "meta": {
+    "elapsed_ms": 1420,
+    "queue_wait_ms": 0,
+    "engines": ["gemini", "cloudflare"]
+  }
+}
+```
 
-## Run it on your computer (Windows PowerShell)
+---
 
+## Environment Variables & Configuration
+
+Configure these in your `.env` file or in your hosting provider's dashboard (e.g., Render Environment Settings):
+
+### Core API & Security
+| Variable | Default | Description |
+|---|---|---|
+| `API_TOKEN` | *(required)* | Secure random token required for `/api/*` REST endpoints. |
+| `ALLOWED_ORIGINS` | `""` | Comma-separated CORS origins (e.g. `https://cat-brandbounce.lovable.app`). |
+| `ALLOW_LOCALHOST` | `false` | When `true`, permits localhost origins for local frontend testing. |
+| `PORT` | `8000` | HTTP port for the web service. |
+
+### Background Worker & Lovable Bridge
+| Variable | Default | Description |
+|---|---|---|
+| `WORKER_API_KEY` | *(required for worker)* | Shared secret key for the Lovable API bridge (`x-worker-api-key`). |
+| `LOVABLE_BASE_URL` | `https://cat-brandbounce.lovable.app/api/public/worker` | Base URL of Lovable worker endpoints. |
+| `WORKER_AUTOSTART` | `false` | When `true`, automatically starts the worker thread inside the web container. |
+| `BATCH_SIZE` | `20` | Maximum pending segments fetched per polling cycle (1 - 100). |
+| `CHUNK_SIZE` | `10` | Maximum segments processed per translation pipeline request (1 - 20). |
+| `POLL_INTERVAL` | `5.0` | Initial polling interval in seconds when checking for new jobs. |
+| `IDLE_BACKOFF_MAX` | `30.0` | Maximum sleep duration in seconds when the job queue is empty. |
+| `MAX_CHUNK_RETRIES` | `2` | Number of retries before falling back to source text for a chunk. |
+| `WORKER_HTTP_TIMEOUT` | `60.0` | Timeout in seconds for HTTP requests to Lovable. |
+
+### Translation Engines
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | *(required for gemini)* | Google AI Studio API key. |
+| `GEMINI_MODELS` | `gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemma-4-26b-a4b-it` | Ordered cascade of Gemini models. |
+| `CLOUDFLARE_ACCOUNT_ID` | `""` | Cloudflare account ID for Workers AI. |
+| `CLOUDFLARE_API_TOKEN` | `""` | Cloudflare API token with `Workers AI:Run` permission. |
+| `CLOUDFLARE_MODEL` | `@cf/meta/m2m100-1.2b` | Cloudflare translation model. |
+| `MYMEMORY_EMAIL` | `""` | Email address to lift MyMemory daily quota to 50k chars. |
+| `ENGINE_ORDER` | `gemini,cloudflare,mymemory` | Fallback chain execution order. |
+| `ENGINE_DELAYS` | `gemini:4.0-5.0,cloudflare:0.5-1.0,mymemory:0.5-1.0` | Request pacing range per engine (seconds). |
+| `COOLDOWN_STEPS` | `300,900,3600` | Progressive cooldown durations in seconds (5m → 15m → 60m). |
+
+---
+
+## Local Setup & Development
+
+### 1. Create Virtual Environment & Install Dependencies
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 pip install -r requirements-dev.txt
+```
 
-# Copy .env.example to .env and fill in at minimum API_TOKEN and GEMINI_API_KEY
-copy .env.example .env
+### 2. Configure Local Environment
+Create `.env`:
+```ini
+API_TOKEN=local-testing-secret-token-32chars
+WORKER_API_KEY=your-lovable-worker-secret-key
+LOVABLE_BASE_URL=https://cat-brandbounce.lovable.app/api/public/worker
+WORKER_AUTOSTART=true
+GEMINI_API_KEY=your-gemini-api-key
+BATCH_SIZE=20
+CHUNK_SIZE=10
+```
 
-$env:API_TOKEN = "any-long-secret-at-least-16-chars"
+### 3. Run the Service
+**Run Web API with In-Process Worker Thread**:
+```powershell
 uvicorn app.main:create_app --factory --port 8000
 ```
 
-In a second window:
-
+**Or Run Standalone Background Worker**:
 ```powershell
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
-$h = @{ Authorization = "Bearer any-long-secret-at-least-16-chars" }
-Invoke-RestMethod http://localhost:8000/api/health
-Invoke-RestMethod http://localhost:8000/api/selftest -Headers $h | ConvertTo-Json -Depth 6
-Invoke-RestMethod http://localhost:8000/api/translate -Method Post -Headers $h -ContentType "application/json; charset=utf-8" `
-  -Body '{"sl":"en","tl":"bn","segments":["Hello, how are you?"]}' | ConvertTo-Json -Depth 6
+python worker.py
 ```
 
-Run the tests: `python -m pytest tests/ -v` (or `python -m unittest discover -s tests -t .`). The HTTP tests in `tests/test_api.py` only run when `fastapi` and `httpx` are installed (`requirements-dev.txt`).
+### 4. Run Test Suite
+```powershell
+python -m unittest discover -s tests -t .
+```
 
-## Deploy on Render
+---
 
-1. Put this folder in a **new private GitHub repository** (for example `cat-translate-api`). The `.env` file is ignored; never commit it.
-2. Make a token. In PowerShell:
-   ```powershell
-   $b = New-Object byte[] 32; (New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($b); [Convert]::ToBase64String($b)
-   ```
-   Save it somewhere safe. You will paste it into the CAT tool later.
-3. On Render: **New > Web Service**, connect the repository, choose **Docker** as the runtime and the **Free** plan. (Or use **New > Blueprint**, which reads `render.yaml`.)
-4. Under **Environment**, add at minimum:
-   - `API_TOKEN` = the token from step 2
-   - `GEMINI_API_KEY` = your Google AI Studio API key (required for the primary engine)
-   - `ALLOWED_ORIGINS` = your CAT site addresses, comma separated, e.g. `https://your-site.lovable.app,https://*.lovable.app`
-   - Optionally: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `MYMEMORY_EMAIL`
-5. Set the health check path to `/api/health`, then deploy.
-6. When it is live, check, in this order:
-   - `GET /api/health` shows `"ok": true`
-   - `GET /api/selftest` with your token. This tells you which engines work **from Render's address**. Send me the result if any show `failed` or `cooldown`.
-   - one small `POST /api/translate`
-7. To change the token: set a new `API_TOKEN` in Render, redeploy, and update the CAT tool.
+## Deployment on Render
 
-Things to expect on the free plan: the service sleeps after a period of no traffic, so the first request can take up to a minute (call `/api/health` first). The cache and cooldown state reset when it restarts or sleeps.
+1. **Create Web Service**:
+   - In Render, create a new **Web Service** pointing to your repository.
+   - Environment: **Python 3** (or **Docker**).
+   - Build Command: `pip install -r requirements.txt`
+   - Start Command: `uvicorn app.main:create_app --factory --host 0.0.0.0 --port $PORT`
 
-## Settings (environment variables)
+2. **Configure Environment Variables in Render**:
+   - `API_TOKEN`: Random 32+ character string.
+   - `WORKER_API_KEY`: Secret key matching `WORKER_API_KEY` in Lovable Project Settings.
+   - `LOVABLE_BASE_URL`: `https://<your-project>.lovable.app/api/public/worker`
+   - `WORKER_AUTOSTART`: `true` (enables worker thread alongside web server).
+   - `GEMINI_API_KEY`: Google AI Studio API key.
+   - `ALLOWED_ORIGINS`: `https://<your-project>.lovable.app`
 
-Everything is an environment variable; `.env.example` lists them all with explanations. The ones you are most likely to change:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `API_TOKEN` | *(required)* | Long random bearer token for all authenticated endpoints. |
-| `GEMINI_API_KEY` | *(required for gemini)* | Single Google AI Studio API key. No key rotation. |
-| `GEMINI_MODELS` | `gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemma-4-26b-a4b-it` | Ordered model cascade inside the Gemini engine. |
-| `CLOUDFLARE_ACCOUNT_ID` | *(optional)* | Cloudflare account ID for Workers AI. |
-| `CLOUDFLARE_API_TOKEN` | *(optional)* | Cloudflare API token with Workers AI:Run permission. |
-| `CLOUDFLARE_MODEL` | `@cf/meta/m2m100-1.2b` | Cloudflare translation model. |
-| `MYMEMORY_EMAIL` | *(optional)* | Email for MyMemory free quota (5 k → 50 k chars/day). |
-| `ENGINE_ORDER` | `gemini,cloudflare,mymemory` | Fallback chain order. |
-| `ENGINE_DELAYS` | `gemini:4.0-5.0,cloudflare:0.5-1.0,mymemory:0.5-1.0` | Per-engine pacing (seconds). |
-| `COOLDOWN_STEPS` | `300,900,3600` | Engine cooldown escalation (5 min → 15 min → 60 min). |
-| `ALLOWED_ORIGINS` | *(empty)* | CORS origins for browser clients, comma separated. |
-
-## Troubleshooting
-
-| What you see | What it means |
-|---|---|
-| `401 Invalid or missing token` | The token in the CAT tool differs from `API_TOKEN`, or the header is not `Authorization: Bearer ...`. |
-| Browser says CORS blocked | The site's address is not in `ALLOWED_ORIGINS`. Add it exactly as the browser shows it (scheme included, no trailing slash). |
-| Every engine shows `blocked` or `cooldown` | An upstream provider is refusing this server's address. Wait for the cooldown, or check API key validity. |
-| `engine ... cooling down` in `attempts` | That engine is resting on purpose. `/api/engines` shows how long is left. |
-| `503 Busy` | Another request is running. The CAT tool should wait a few seconds and retry. |
-| First request very slow | Render woke the service up. Call `/api/health` first. |
-| Gemini returns localized digits (০-৯) | The normalizer converts them to ASCII 0-9 automatically; if you still see them, check `textutils.normalize_ascii_digits`. |
-
-## Adding another engine later
-
-1. Create `app/engines/my_engine.py` with a class that has a `name` and a `translate(text, sl, tl, timeout)` method. It returns text or raises `EngineError(kind, message)`. Use `classify_exception` for library errors.
-2. Add the class to `ENGINE_CLASSES` in `app/engines/__init__.py`.
-3. Put its name in `ENGINE_ORDER` and, if it needs a different pause, in `ENGINE_DELAYS`.
-4. Add keys for official services (Azure, Google Cloud) as environment variables in Render, never in the code.
-
-Official engines will also need a monthly character cap that survives restarts. That needs a small database, which is left for a later phase.
-
-## What has and has not been tested
-
-The queue, fallback chain, cooldowns, pacing, timeouts, cache, validation and error scrubbing have unit tests with fake engines. The Gemini engine is tested with mocked `requests.post` responses (including thought-token filtration, model cascade, tag preservation, digit normalization, and 429 cascades). The Cloudflare and MyMemory engines are tested with mocked HTTP responses. The API layer is tested with FastAPI's test client. Nothing here has been run against the real Gemini or Cloudflare services in CI, so the `/api/selftest` endpoint is the real integration check.
+3. **Verify Deployment**:
+   - Visit `https://<your-service>.onrender.com/api/health` → should return `{"ok": true}`.
+   - Trigger a translation job in Lovable → worker claims, processes in chunks, and uploads the translated DOCX file.

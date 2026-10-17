@@ -243,6 +243,107 @@ class WorkerTests(unittest.TestCase):
         found = daemon.run_once()
         self.assertFalse(found)
 
+    def test_job_processor_controlled_chunking(self):
+        mock_http = MagicMock()
+        # 25 pending segments
+        pending_25 = [
+            {"id": f"seg-{i}", "segment_index": i, "source_text": f"Sentence {i}"}
+            for i in range(25)
+        ]
+        mock_http.get.side_effect = [
+            fake_resp(200, json={"segments": pending_25}),
+            fake_resp(200, json={"segments": []}),
+        ]
+        mock_http.post.return_value = fake_resp(200, json={"ok": True})
+
+        client = LovableWorkerClient(self.config, client=mock_http)
+        mock_pipeline = MagicMock()
+        # Track lengths of batches passed to run_batch
+        passed_batch_sizes = []
+
+        def fake_run_batch(texts, sl="en", tl="bn"):
+            passed_batch_sizes.append(len(texts))
+            from app.pipeline import Result
+            return [Result(text=f"Trans: {t}") for t in texts], {}
+
+        mock_pipeline.run_batch.side_effect = fake_run_batch
+
+        # Initialize processor with batch_size=25, chunk_size=10
+        processor = JobProcessor(client, mock_pipeline, batch_size=25, chunk_size=10)
+        job = {
+            "id": "job-chunk-1",
+            "user_id": "user-1",
+            "file_name": "test.docx",
+            "original_file_path": "",
+            "total_segments": 25,
+        }
+
+        processor.process(job)
+
+        # Chunks must be [10, 10, 5], never oversized
+        self.assertEqual(passed_batch_sizes, [10, 10, 5])
+        # Verify 3 chunk submissions to /segments
+        submission_calls = [
+            call for call in mock_http.post.call_args_list if call[0][0] == "/segments"
+        ]
+        self.assertEqual(len(submission_calls), 3)
+        self.assertEqual(len(submission_calls[0][1]["json"]["results"]), 10)
+        self.assertEqual(len(submission_calls[1][1]["json"]["results"]), 10)
+        self.assertEqual(len(submission_calls[2][1]["json"]["results"]), 5)
+
+    def test_job_processor_chunk_error_isolation_and_recovery(self):
+        mock_http = MagicMock()
+        pending_segments = [
+            {"id": "seg-1", "segment_index": 0, "source_text": "Failing sentence"},
+            {"id": "seg-2", "segment_index": 1, "source_text": "Working sentence"},
+        ]
+        mock_http.get.side_effect = [
+            fake_resp(200, json={"segments": pending_segments}),
+            fake_resp(200, json={"segments": []}),
+        ]
+        mock_http.post.return_value = fake_resp(200, json={"ok": True})
+
+        client = LovableWorkerClient(self.config, client=mock_http)
+        mock_pipeline = MagicMock()
+
+        call_count = 0
+
+        def failing_run_batch(texts, sl="en", tl="bn"):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:  # Fails for first chunk (attempt 1 and retry 2)
+                raise TimeoutError("Engine timed out")
+            from app.pipeline import Result
+            return [Result(text="অনূদিত বাক্য")], {}
+
+        mock_pipeline.run_batch.side_effect = failing_run_batch
+
+        # chunk_size=1 so each segment is processed in its own chunk
+        processor = JobProcessor(client, mock_pipeline, batch_size=10, chunk_size=1, max_chunk_retries=1)
+        job = {
+            "id": "job-isolate-1",
+            "user_id": "user-1",
+            "file_name": "test.docx",
+            "original_file_path": "",
+            "total_segments": 2,
+        }
+
+        # The job must NOT crash despite chunk 1 failing
+        processor.process(job)
+
+        submission_calls = [
+            call for call in mock_http.post.call_args_list if call[0][0] == "/segments"
+        ]
+        self.assertEqual(len(submission_calls), 2)
+        # First chunk fell back safely to source text
+        self.assertEqual(submission_calls[0][1]["json"]["results"][0]["target_text"], "Failing sentence")
+        # Second chunk was translated
+        self.assertEqual(submission_calls[1][1]["json"]["results"][0]["target_text"], "অনূদিত বাক্য")
+
+        # Job completed status
+        status_calls = [call for call in mock_http.post.call_args_list if call[0][0] == "/status"]
+        self.assertEqual(status_calls[-1][1]["json"]["status"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()
