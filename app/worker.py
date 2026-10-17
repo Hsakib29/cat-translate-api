@@ -293,10 +293,23 @@ class JobProcessor:
             translated_path: Optional[str] = None
             if orig_bytes:
                 try:
+                    # Read bilingual column config from job metadata (if present)
+                    # Default: source_col=0 (C0=English), target_col=1 (C1=Translation)
+                    bilingual_source_col: int = int(job.get("bilingual_source_col", 0))
+                    bilingual_target_col: Optional[int] = job.get("bilingual_target_col")
+                    if bilingual_target_col is not None:
+                        bilingual_target_col = int(bilingual_target_col)
+                        log.info(
+                            "Job %s: Bilingual mode — writing translations into col %d (source col %d).",
+                            job_id, bilingual_target_col, bilingual_source_col,
+                        )
+
                     reconstructed = reconstruct_docx(
                         orig_bytes,
                         source_to_target,
                         index_to_target=index_to_target,
+                        bilingual_target_col=bilingual_target_col,
+                        bilingual_source_col=bilingual_source_col,
                     )
                     translated_path = self.api.upload_translated_file(
                         user_id=user_id,
