@@ -128,7 +128,7 @@ class Pipeline:
         waited_ms = int((self.clock() - started) * 1000)
         try:
             deadline = self.clock() + self.s.batch_deadline_seconds
-            results = [self._translate_one(text, sl, tl, names, deadline) for text in segments]
+            results = self._translate_batch(segments, sl, tl, names, deadline)
         finally:
             self._queue.release()
         meta = {
@@ -137,6 +137,79 @@ class Pipeline:
             "engines": names,
         }
         return results, meta
+
+    def _translate_batch(
+        self, segments: list[str], sl: str, tl: str, chain: list[str], deadline: float
+    ) -> list[Result]:
+        if not segments:
+            return []
+
+        results: list[Result | None] = [None] * len(segments)
+        uncached_indices: list[int] = []
+
+        for i, text in enumerate(segments):
+            if not text.strip():
+                results[i] = Result(text=text, via="passthrough")
+                continue
+            if not has_letters(text):
+                results[i] = Result(text=text, via="passthrough")
+                continue
+            hit = self._cache_get(sl, tl, text)
+            if hit:
+                results[i] = Result(text=hit[0], via=hit[1], cached=True)
+                continue
+            uncached_indices.append(i)
+
+        if not uncached_indices:
+            return [r for r in results if r is not None]
+
+        # Context-aware batch translation: if primary engine in chain supports batching (e.g. Gemini),
+        # translate all uncached segments together in a single contextual call.
+        if len(uncached_indices) > 1 and chain:
+            primary_name = chain[0]
+            engine = self.engines[primary_name]
+            can_batch = (
+                hasattr(engine, "translate_batch")
+                and callable(getattr(engine, "translate_batch"))
+                and self._cooldown_remaining(primary_name) == 0
+                and engine.supports(sl, tl)
+                and self.clock() < deadline
+            )
+            if can_batch:
+                uncached_texts = [segments[idx] for idx in uncached_indices]
+                self._pace(primary_name)
+                with self._state_lock:
+                    self.states[primary_name].calls += 1
+                batch_start = self.clock()
+                try:
+                    batch_outputs = call_with_timeout(
+                        lambda: engine.translate_batch(
+                            uncached_texts, sl, tl, self.s.engine_timeout_seconds
+                        ),
+                        self.s.engine_timeout_seconds + TIMEOUT_GRACE,
+                    )
+                    if isinstance(batch_outputs, list) and len(batch_outputs) == len(uncached_texts):
+                        self._record_success(primary_name, int((self.clock() - batch_start) * 1000))
+                        for idx, trans in zip(uncached_indices, batch_outputs):
+                            src = segments[idx]
+                            self._cache_put(sl, tl, src, trans, primary_name)
+                            results[idx] = Result(text=trans, via=primary_name)
+                        with self._state_lock:
+                            self.states[primary_name].last_end = self.clock()
+                except BaseException as exc:
+                    err = classify_exception(exc)
+                    self._record_failure(
+                        primary_name, err, uncached_texts[0] if uncached_texts else ""
+                    )
+                    with self._state_lock:
+                        self.states[primary_name].last_end = self.clock()
+
+        # For any segment not batch-translated (or on batch fallback), resolve via individual fallback chain
+        for idx in range(len(segments)):
+            if results[idx] is None:
+                results[idx] = self._translate_one(segments[idx], sl, tl, chain, deadline)
+
+        return [r for r in results if r is not None]
 
     def selftest(self, sl: str = "en", tl: str = "bn", force: bool = False) -> list[dict]:
         now = self.clock()

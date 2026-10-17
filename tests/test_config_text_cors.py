@@ -3,7 +3,7 @@ import unittest
 
 from app.config import ConfigError, Settings, parse_delays, parse_steps
 from app.cors import build_cors
-from app.textutils import chunk_text, has_letters, scrub
+from app.textutils import chunk_text, has_letters, scrub, to_bn_digits
 from app.validation import RequestError, validate_langs, validate_translate
 
 from .helpers import make_settings
@@ -84,6 +84,24 @@ class TextTests(unittest.TestCase):
         giant = chunk_text("x" * 250, 100)
         self.assertEqual(["".join(giant)], ["x" * 250])
         self.assertTrue(all(len(c) <= 100 for c in giant))
+
+    def test_to_bn_digits(self):
+        # Regular standalone numbers are converted to Bengali digits
+        self.assertEqual(to_bn_digits("Year 2026"), "Year ২০২৬")
+        self.assertEqual(to_bn_digits("অধ্যায় 1: ভূমিকা"), "অধ্যায় ১: ভূমিকা")
+
+        # URLs, emails, codes, and placeholders are preserved
+        self.assertEqual(
+            to_bn_digits("Visit https://example.com/api/v1/page/2 and contact test1@domain.com"),
+            "Visit https://example.com/api/v1/page/2 and contact test1@domain.com",
+        )
+        self.assertEqual(to_bn_digits("Code COVID-19 and Item-3A"), "Code COVID-19 and Item-3A")
+        self.assertEqual(to_bn_digits("Hello {0} and {1}"), "Hello {0} and {1}")
+
+        # Mixed text with both types
+        mixed = "অধ্যায় 1: দেখুন https://gov.bd/doc/99 এবং COVID-19 এর জন্য 2026 সালের বাজেট।"
+        expected = "অধ্যায় ১: দেখুন https://gov.bd/doc/99 এবং COVID-19 এর জন্য ২০২৬ সালের বাজেট।"
+        self.assertEqual(to_bn_digits(mixed), expected)
 
 
 class CorsTests(unittest.TestCase):

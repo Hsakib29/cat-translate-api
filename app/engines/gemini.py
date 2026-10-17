@@ -61,15 +61,27 @@ def _strip_thought_blocks(candidate: dict[str, Any]) -> tuple[str, list[str]]:
 
 
 def _build_system_instruction(sl: str, tl: str) -> str:
+    target_guidance = ""
+    if tl.lower() in ("bn", "ben", "bengali"):
+        target_guidance = (
+            "BENGALI (বাংলা) EDITORIAL GUIDELINES:\n"
+            "- Produce natural, fluent, and idiomatic Bengali adhering to standard Subject-Object-Verb (SOV) structure.\n"
+            "- Avoid rigid, mechanical word-for-word calques or awkward literal phrasing.\n"
+            "- Use refined, polished, and standard formal register (মার্জিত প্রমিত চলিত বাংলা) suitable for scholarly journals, publications (e.g. EA Journal), and institutional reports.\n"
+            "- Ensure contextual flow, coherent pronoun/tense references, and smooth transitions across adjacent segments in the sequence.\n"
+            "- Professional terminology for headings, titles, and table headers should use standard, publication-grade equivalents (e.g., 'Executive Summary' -> 'নির্বাহী সারসংক্ষেপ', 'Table of Contents' -> 'সূচিপত্র', 'Editorial Board' -> 'সম্পাদকীয় পর্ষদ').\n\n"
+        )
+
     return (
-        f"You are an uncompromising translation engine for Computer Assisted Translation (CAT) software.\n"
-        f"Translate the text values from source language '{sl}' into target language '{tl}'.\n"
+        f"You are an expert bilingual senior editor and professional translator for scholarly journals, periodicals, and Computer Assisted Translation (CAT) systems.\n"
+        f"Translate the text values from source language '{sl}' into target language '{tl}' with utmost fluency, semantic accuracy, and natural readability.\n"
         f"The input is a JSON object mapping integer sequence IDs to source segments.\n"
         f"You MUST output a valid JSON object with the identical integer sequence IDs as keys.\n\n"
+        f"{target_guidance}"
         f"STRICT INVARIANTS:\n"
         f"1. Retain every single sequence key without exception. Do not merge, reorder, or skip keys.\n"
         f"2. Preserve all placeholders, variables, and tags EXACTLY as they appear (e.g. {{0}}, {{ 1 }}, {{name}}, <br/>). Never alter, translate, or remove them.\n"
-        f"3. Preserve all numerical digits strictly as ASCII characters '0'-'9'. Never convert numbers into localized numerals (e.g. do not use ০-৯ or ۰-۹).\n"
+        f"3. Preserve all numerical digits inside placeholder tags or technical codes strictly as ASCII characters '0'-'9'.\n"
         f"4. Output raw JSON only. Do not wrap in markdown ```json ``` blocks. No introductory or concluding remarks."
     )
 

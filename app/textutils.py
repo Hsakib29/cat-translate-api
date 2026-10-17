@@ -49,6 +49,25 @@ def normalize_ascii_digits(text: str) -> str:
     return text.translate(_VERNACULAR_DIGITS)
 
 
+BN_DIGITS = "০১২৩৪৫৬৭৮৯"
+_KEEP_RE = re.compile(
+    r"(?:https?://|www\.)\S+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+|\{[0-9\s]+\}|[A-Za-z0-9_#-]*[A-Za-z][A-Za-z0-9_#-]*|[0-9]"
+)
+
+
+def to_bn_digits(s: str) -> str:
+    """Converts standalone ASCII digits '0'-'9' to Bengali digits '০'-'৯'.
+    Preserves numbers in URLs, emails, placeholder tags like {0}, and codes touching Latin letters (e.g. COVID-19, A123, MP3).
+    """
+    def _repl(m: re.Match) -> str:
+        matched = m.group(0)
+        if len(matched) == 1 and "0" <= matched <= "9":
+            return BN_DIGITS[int(matched)]
+        return matched
+
+    return _KEEP_RE.sub(_repl, s)
+
+
 def find_tags(text: str) -> list[str]:
     """Find placeholder tags like {0}, { 1 }, {name}, or HTML tags in text."""
     return _TAG_PATTERN.findall(text)

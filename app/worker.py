@@ -158,7 +158,9 @@ class LovableWorkerClient:
         resp.raise_for_status()
 
 
-from .doc_processor import extract_segments_from_docx, reconstruct_docx
+import docx
+from .doc_processor import extract_segments_from_docx, is_bilingual_table, reconstruct_docx
+from .textutils import to_bn_digits
 
 
 class JobProcessor:
@@ -185,10 +187,13 @@ class JobProcessor:
         filename = job.get("file_name", "document.docx")
         orig_path = job["original_file_path"]
         total_segments = job.get("total_segments", 0)
+        sl = job.get("source_language", "en")
+        tl = job.get("target_language", "bn")
+        is_bn = tl.lower() in ("bn", "ben", "bengali")
 
         log.info(
-            "Processing Job ID=%s File=%s TotalSegments=%d (batch_size=%d, chunk_size=%d)",
-            job_id, filename, total_segments, self.batch_size, self.chunk_size
+            "Processing Job ID=%s File=%s TotalSegments=%d (sl=%s, tl=%s, batch_size=%d, chunk_size=%d)",
+            job_id, filename, total_segments, sl, tl, self.batch_size, self.chunk_size
         )
 
         source_to_target: Dict[str, str] = {}
@@ -224,7 +229,7 @@ class JobProcessor:
                     last_chunk_err = None
                     for attempt in range(self.max_chunk_retries + 1):
                         try:
-                            results, _meta = self.pipeline.run_batch(chunk_source_texts, sl="en", tl="bn")
+                            results, _meta = self.pipeline.run_batch(chunk_source_texts, sl=sl, tl=tl)
                             break
                         except Exception as err:
                             last_chunk_err = err
@@ -246,6 +251,10 @@ class JobProcessor:
                             # Safe fallback so segment doesn't hang indefinitely in pending
                             target_text = seg.get("source_text", "")
                             status = "translated"
+
+                        # Apply digit localization for Bengali target language
+                        if is_bn:
+                            target_text = to_bn_digits(target_text)
 
                         chunk_submission.append({
                             "id": seg["id"],
@@ -297,7 +306,21 @@ class JobProcessor:
                     # Default: source_col=0 (C0=English), target_col=1 (C1=Translation)
                     bilingual_source_col: int = int(job.get("bilingual_source_col", 0))
                     bilingual_target_col: Optional[int] = job.get("bilingual_target_col")
-                    if bilingual_target_col is not None:
+
+                    # Auto-detect if not explicitly configured in job metadata
+                    if bilingual_target_col is None:
+                        try:
+                            doc_preview = docx.Document(io.BytesIO(orig_bytes))
+                            if any(is_bilingual_table(t, 0, 1) for t in doc_preview.tables):
+                                bilingual_source_col = 0
+                                bilingual_target_col = 1
+                                log.info(
+                                    "Job %s: Auto-detected two-column bilingual table layout (source_col=0, target_col=1).",
+                                    job_id,
+                                )
+                        except Exception as detect_err:
+                            log.warning("Job %s: Bilingual table auto-detection skipped: %s", job_id, detect_err)
+                    elif bilingual_target_col is not None:
                         bilingual_target_col = int(bilingual_target_col)
                         log.info(
                             "Job %s: Bilingual mode — writing translations into col %d (source col %d).",
@@ -310,6 +333,7 @@ class JobProcessor:
                         index_to_target=index_to_target,
                         bilingual_target_col=bilingual_target_col,
                         bilingual_source_col=bilingual_source_col,
+                        tl=tl,
                     )
                     translated_path = self.api.upload_translated_file(
                         user_id=user_id,

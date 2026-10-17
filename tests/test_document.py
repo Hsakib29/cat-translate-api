@@ -12,16 +12,19 @@ import io
 import unittest
 
 import docx
+from docx.shared import Pt, RGBColor
 from app.doc_processor import (
     DocumentSegment,
     detect_element_type,
     extract_indexed_segments,
     extract_segments_from_docx,
+    is_bilingual_table,
     is_translatable,
     iter_document_elements,
     iter_document_paragraphs,
     iter_table_paragraphs,
     reconstruct_docx,
+    reconstruct_docx_bilingual,
     update_paragraph_text,
 )
 
@@ -239,6 +242,136 @@ class TestDocumentProcessing(unittest.TestCase):
         paras = list(iter_table_paragraphs(outer_table))
         texts = [p.text for p in paras if p.text.strip()]
         self.assertEqual(texts, ["Outer Cell Para", "Nested Cell Para 1", "Nested Cell Para 2"])
+
+    def test_is_bilingual_table_detection(self):
+        """Verifies accurate detection of bilingual tables (>=2 rows, >=50% target cells empty)."""
+        doc = docx.Document()
+        # Table 1: Standard bilingual table with empty column 1
+        t1 = doc.add_table(rows=3, cols=2)
+        t1.cell(0, 0).paragraphs[0].text = "Header English"
+        t1.cell(0, 1).paragraphs[0].text = ""
+        t1.cell(1, 0).paragraphs[0].text = "Section 1 English"
+        t1.cell(1, 1).paragraphs[0].text = ""
+        t1.cell(2, 0).paragraphs[0].text = "Section 2 English"
+        t1.cell(2, 1).paragraphs[0].text = ""
+        self.assertTrue(is_bilingual_table(t1, 0, 1))
+
+        # Table 2: Monolingual / already populated table
+        t2 = doc.add_table(rows=3, cols=2)
+        t2.cell(0, 0).paragraphs[0].text = "Col A"
+        t2.cell(0, 1).paragraphs[0].text = "Col B"
+        t2.cell(1, 0).paragraphs[0].text = "Data 1"
+        t2.cell(1, 1).paragraphs[0].text = "Data 2"
+        t2.cell(2, 0).paragraphs[0].text = "Data 3"
+        t2.cell(2, 1).paragraphs[0].text = "Data 4"
+        self.assertFalse(is_bilingual_table(t2, 0, 1))
+
+        # Table 3: Single-row table cannot be bilingual
+        t3 = doc.add_table(rows=1, cols=2)
+        t3.cell(0, 0).paragraphs[0].text = "English"
+        t3.cell(0, 1).paragraphs[0].text = ""
+        self.assertFalse(is_bilingual_table(t3, 0, 1))
+
+    def test_reconstruct_docx_bilingual_preserves_c0_and_clones_run_styles(self):
+        """Verifies reconstruct_docx_bilingual:
+        1. Leaves Column 0 (English) completely intact.
+        2. Populates Column 1 (Target) with translated text.
+        3. Clones run styling (bold, italic, font size, color) from C0 to C1.
+        4. Preserves multiline strings using <w:br/> line breaks.
+        5. Localizes digits to Bengali numerals.
+        """
+        doc = docx.Document()
+        table = doc.add_table(rows=2, cols=2)
+
+        # Row 0, Cell 0: Styled run with bold and font size
+        p0 = table.cell(0, 0).paragraphs[0]
+        r0 = p0.add_run("Executive Summary")
+        r0.bold = True
+        r0.font.name = "Calibri"
+        r0.font.size = Pt(14)
+        r0.font.color.rgb = RGBColor(31, 78, 121)
+
+        # Row 0, Cell 1: Empty target
+        table.cell(0, 1).paragraphs[0].text = ""
+
+        # Row 1, Cell 0: Multiline source text
+        p1 = table.cell(1, 0).paragraphs[0]
+        r1 = p1.add_run("Paragraph 1\nParagraph 2 with 2026 data")
+        r1.italic = True
+
+        # Row 1, Cell 1: Empty target
+        table.cell(1, 1).paragraphs[0].text = ""
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        docx_bytes = buf.getvalue()
+
+        # Reconstruct with bilingual writer
+        index_to_target = {
+            0: "নির্বাহী সারসংক্ষেপ",
+            1: "অনুচ্ছেদ ১\nঅনুচ্ছেদ ২ এবং ২০২৬ এর তথ্য",
+        }
+        rebuilt_bytes = reconstruct_docx_bilingual(
+            docx_bytes,
+            index_to_target=index_to_target,
+            source_col=0,
+            target_col=1,
+            tl="bn",
+        )
+
+        rebuilt_doc = docx.Document(io.BytesIO(rebuilt_bytes))
+        rebuilt_table = rebuilt_doc.tables[0]
+
+        # Verify C0 remains unmodified
+        self.assertEqual(rebuilt_table.cell(0, 0).text, "Executive Summary")
+        self.assertEqual(rebuilt_table.cell(1, 0).text, "Paragraph 1\nParagraph 2 with 2026 data")
+
+        # Verify C1 translations
+        self.assertEqual(rebuilt_table.cell(0, 1).text, "নির্বাহী সারসংক্ষেপ")
+        self.assertEqual(
+            rebuilt_table.cell(1, 1).text,
+            "অনুচ্ছেদ ১\nঅনুচ্ছেদ ২ এবং ২০২৬ এর তথ্য",
+        )
+
+        # Verify C1 run styles cloned from C0
+        tgt_run0 = rebuilt_table.cell(0, 1).paragraphs[0].runs[0]
+        self.assertTrue(tgt_run0.bold)
+        self.assertEqual(tgt_run0.font.size, Pt(14))
+        self.assertEqual(tgt_run0.font.color.rgb, RGBColor(31, 78, 121))
+
+        # Verify C1 line break tag <w:br/>
+        tgt_r1 = rebuilt_table.cell(1, 1).paragraphs[0].runs[0]._r
+        self.assertGreaterEqual(len(tgt_r1.xpath("./w:br")), 1)
+
+    def test_reconstruct_docx_auto_detects_bilingual(self):
+        """reconstruct_docx automatically routes to bilingual reconstruction when an empty C1 table is detected."""
+        doc = docx.Document()
+        table = doc.add_table(rows=2, cols=2)
+        table.cell(0, 0).paragraphs[0].text = "Topic Introduction"
+        table.cell(0, 1).paragraphs[0].text = ""
+        table.cell(1, 0).paragraphs[0].text = "Detailed Analysis"
+        table.cell(1, 1).paragraphs[0].text = ""
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        docx_bytes = buf.getvalue()
+
+        rebuilt_bytes = reconstruct_docx(
+            docx_bytes,
+            translations={},
+            index_to_target={
+                0: "বিষয়ের ভূমিকা",
+                1: "বিস্তারিত বিশ্লেষণ",
+            },
+            tl="bn",
+        )
+
+        rebuilt_doc = docx.Document(io.BytesIO(rebuilt_bytes))
+        rebuilt_table = rebuilt_doc.tables[0]
+        self.assertEqual(rebuilt_table.cell(0, 0).text, "Topic Introduction")
+        self.assertEqual(rebuilt_table.cell(0, 1).text, "বিষয়ের ভূমিকা")
+        self.assertEqual(rebuilt_table.cell(1, 0).text, "Detailed Analysis")
+        self.assertEqual(rebuilt_table.cell(1, 1).text, "বিস্তারিত বিশ্লেষণ")
 
 
 if __name__ == "__main__":

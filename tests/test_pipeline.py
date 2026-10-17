@@ -105,6 +105,34 @@ class ChainAndCache(unittest.TestCase):
         self.assertNotIn("secret", results[0].error.lower())
         self.assertIn("<text>", results[0].error)
 
+    def test_contextual_batch_translation_success_and_fallback(self):
+        class BatchEngine(FakeEngine):
+            def __init__(self, name, should_fail=False):
+                super().__init__(name)
+                self.should_fail = should_fail
+                self.batch_calls = []
+
+            def translate_batch(self, texts, sl, tl, timeout=None):
+                self.batch_calls.append(texts)
+                if self.should_fail:
+                    raise RuntimeError("Batch LLM connection drop")
+                return [f"batch:{t}" for t in texts]
+
+        # Case 1: Batch translation succeeds
+        batch_eng = BatchEngine("batch_eng")
+        pipe, _, _ = make_pipeline([batch_eng])
+        results, _ = pipe.run_batch(["First sentence", "Second sentence"], EN, BN)
+        self.assertEqual(results[0].text, "batch:First sentence")
+        self.assertEqual(results[1].text, "batch:Second sentence")
+        self.assertEqual(len(batch_eng.batch_calls), 1)
+
+        # Case 2: Batch translation fails, gracefully falls back to single-segment processing
+        failing_batch = BatchEngine("failing_batch", should_fail=True)
+        pipe2, _, _ = make_pipeline([failing_batch])
+        results2, _ = pipe2.run_batch(["Seg A", "Seg B"], EN, BN)
+        self.assertEqual(results2[0].text, "failing_batch:Seg A")
+        self.assertEqual(results2[1].text, "failing_batch:Seg B")
+
 
 class Cooldowns(unittest.TestCase):
     def test_block_page_trips_at_once_and_engine_is_skipped(self):

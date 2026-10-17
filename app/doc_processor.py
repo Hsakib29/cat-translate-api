@@ -18,6 +18,8 @@ from docx.document import Document as DocxDocument
 from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
 
+from .textutils import to_bn_digits
+
 log = logging.getLogger("cat.doc_processor")
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -235,51 +237,116 @@ def extract_segments_from_docx(
     return [seg.source_text for seg in extract_indexed_segments(doc_or_bytes, source_col=source_col)]
 
 
-def update_paragraph_text(p: Paragraph, translated_text: str) -> None:
+def is_bilingual_table(table: Table, source_col: int = 0, target_col: int = 1) -> bool:
+    """Detects whether a table is a bilingual translation table.
+    A table is bilingual if it has >= 2 rows with at least 2 columns,
+    and >= 50% of those rows have an empty target column cell.
+    """
+    rows = table.rows
+    if len(rows) < 2:
+        return False
+    two_col_count = 0
+    target_empty_count = 0
+    for row in rows:
+        cells = row.cells
+        if len(cells) <= max(source_col, target_col):
+            continue
+        two_col_count += 1
+        tgt_text = "".join(p.text for p in cells[target_col].paragraphs).strip()
+        if not tgt_text:
+            target_empty_count += 1
+    if two_col_count < 2:
+        return False
+    return (target_empty_count / two_col_count) >= 0.5
+
+
+def _extract_primary_rpr(p: Paragraph) -> Any:
+    """Finds the first run with non-empty rPr styling in a paragraph, if any."""
+    for r in p.runs:
+        rpr = r._r.find(f"{{{W_NS}}}rPr")
+        if rpr is not None and len(rpr) > 0:
+            return rpr
+    rprs = p._p.findall(f".//{{{W_NS}}}r/{{{W_NS}}}rPr")
+    for rpr in rprs:
+        if len(rpr) > 0:
+            return rpr
+    return None
+
+
+def update_paragraph_text(
+    p: Paragraph,
+    translated_text: str,
+    src_p: Optional[Paragraph] = None,
+) -> None:
     """Updates a paragraph's text while strictly preserving its formatting,
     run styles, and bullet list attributes (w:numPr).
 
     - Does NOT delete or replace the paragraph XML node (<w:p>) or properties (<w:pPr>).
     - Preserves bullet points, outline levels, indentation, and paragraph styles.
-    - Updates the primary run to retain font, size, bold, italic, and color.
-    - Clears trailing text runs without destroying inline drawings or images.
+    - Clones font family, size, bold, italic, color, and underline from src_p (or p's primary run).
+    - Preserves drawing objects and inline graphics.
+    - Properly encodes multiline strings using <w:br/> line breaks inside runs.
     """
+    import copy
+
     runs = p.runs
-    if not runs:
-        p.add_run(translated_text)
-        return
+    primary_run = runs[0] if runs else p.add_run()
 
-    # Update text in the primary run to keep its run styling
-    runs[0].text = translated_text
+    # Find run styling template from src_p (if provided) or from p's original runs
+    template_rPr = None
+    if src_p is not None:
+        template_rPr = _extract_primary_rpr(src_p)
+    if template_rPr is None and runs:
+        template_rPr = _extract_primary_rpr(p)
 
-    # Clear secondary runs so old text doesn't trail, but preserve drawing objects
+    if template_rPr is not None:
+        dst_rpr = primary_run._r.find(f"{{{W_NS}}}rPr")
+        if dst_rpr is not None:
+            primary_run._r.remove(dst_rpr)
+        primary_run._r.insert(0, copy.deepcopy(template_rPr))
+
+    # Split on newlines and insert text with <w:br/> breaks
+    lines = translated_text.split("\n")
+    primary_run.text = lines[0]
+    for line in lines[1:]:
+        primary_run.add_break()
+        primary_run.add_text(line)
+
+    # Clean up any remaining text runs, preserving drawings if any
     for r in runs[1:]:
         has_drawing = bool(r._r.xpath("./w:drawing"))
         if not has_drawing:
-            r.text = ""
+            try:
+                p._p.remove(r._r)
+            except Exception:
+                r.text = ""
         else:
             for t in r._r.xpath("./w:t"):
-                t.text = ""
+                r._r.remove(t)
 
 
 def _clone_paragraph_format(src_p: Paragraph, dst_p: Paragraph) -> None:
-    """Clones paragraph-level formatting (w:pPr) from the source paragraph into
+    """Clones paragraph-level formatting (w:pPr) and style from the source paragraph into
     the destination paragraph without overwriting its text content.
     Used to ensure C1 target paragraphs visually match C0 source paragraphs
-    (indentation, numbering, list style, bold, etc.).
+    (indentation, numbering, list style, alignment, etc.).
     """
     import copy
 
     src_xml = src_p._p
     dst_xml = dst_p._p
 
-    # Clone paragraph properties (indentation, numbering, style, etc.)
     src_pPr = src_xml.find(f"{{{W_NS}}}pPr")
     if src_pPr is not None:
         dst_pPr = dst_xml.find(f"{{{W_NS}}}pPr")
         if dst_pPr is not None:
             dst_xml.remove(dst_pPr)
         dst_xml.insert(0, copy.deepcopy(src_pPr))
+    elif src_p.style:
+        try:
+            dst_p.style = src_p.style
+        except Exception:
+            pass
 
 
 def reconstruct_docx_bilingual(
@@ -287,16 +354,19 @@ def reconstruct_docx_bilingual(
     index_to_target: Dict[int, str],
     source_col: int = 0,
     target_col: int = 1,
+    translations: Optional[Dict[str, str]] = None,
+    tl: str = "bn",
 ) -> bytes:
     """Reconstructs a two-column bilingual DOCX document.
 
-    For every row in every table:
+    For every row in every bilingual table:
     - Column `source_col` (C0) is kept **strictly unchanged** as the English source.
-    - Translations from `index_to_target` are written **only into column `target_col`** (C1),
+    - Translations from `index_to_target` (or `translations`) are written **only into column `target_col`** (C1),
       paragraph-by-paragraph, synchronized 1:1 with C0 paragraph counts.
     - C1 paragraph count is synchronized to match C0 (extra paragraphs trimmed,
       missing paragraphs added with formatting cloned from the corresponding C0 paragraph).
     - Formatting (w:pPr, w:rPr) from each C0 paragraph is cloned into the matching C1 paragraph.
+    - Digit localization is applied when target language is Bengali.
 
     Args:
         docx_bytes:      Raw DOCX bytes.
@@ -304,94 +374,88 @@ def reconstruct_docx_bilingual(
                          Indexes are based on `extract_indexed_segments(source_col=source_col)`.
         source_col:      Column index of the source (English) column. Default 0.
         target_col:      Column index to write translations into. Default 1.
+        translations:    Optional direct source_text -> target_text fallback dictionary.
+        tl:              Target language code (e.g. "bn").
 
     Returns:
         Rebuilt DOCX bytes with translations in target column.
     """
-    import copy
-
     doc = docx.Document(io.BytesIO(docx_bytes))
     seg_index = 0
-
     body = doc._body._body
-    table_counter = 0
+    is_bn = tl.lower() in ("bn", "ben", "bengali")
 
-    for child in body.iterchildren():
-        tag = child.tag.split("}")[-1]
-        if tag != "tbl":
+    # Determine if document has any table matching bilingual criteria
+    all_tables = [Table(child, doc) for child in body.iterchildren() if child.tag.split("}")[-1] == "tbl"]
+    has_any_bilingual = any(is_bilingual_table(t, source_col, target_col) for t in all_tables)
+
+    seen_tcs: Set[Any] = set()
+
+    for table in all_tables:
+        if has_any_bilingual and not is_bilingual_table(table, source_col, target_col):
             continue
 
-        table = Table(child, doc)
-        seen_rows: Set[Any] = set()
-
         for row in table.rows:
-            # Deduplicate vertically-merged row references
-            if id(row) in seen_rows:
-                continue
-            seen_rows.add(id(row))
-
             num_cols = len(row.cells)
             if num_cols <= max(source_col, target_col):
-                # Not a two-column row — skip
                 continue
 
             src_cell = row.cells[source_col]
             tgt_cell = row.cells[target_col]
 
-            # Skip if source and target are the same merged cell
+            # Deduplicate vertically or horizontally merged cells
+            if src_cell._tc in seen_tcs:
+                continue
+            seen_tcs.add(src_cell._tc)
+
             if src_cell._tc is tgt_cell._tc:
                 continue
 
             src_paragraphs = src_cell.paragraphs
             tgt_paragraphs = tgt_cell.paragraphs
 
-            # --- Synchronize C1 paragraph count to match C0 ---
             src_count = len(src_paragraphs)
-            tgt_count = len(tgt_paragraphs)
-
             if src_count == 0:
                 continue
 
-            # Add missing paragraphs to C1 by cloning the last C1 paragraph
+            # Ensure C1 has at least 1 paragraph
+            if len(tgt_cell.paragraphs) == 0:
+                tgt_cell.add_paragraph()
+
+            # Synchronize C1 paragraph count to match C0
             while len(tgt_cell.paragraphs) < src_count:
-                last_p = tgt_cell.paragraphs[-1]._p
-                new_p = copy.deepcopy(last_p)
-                # Clear text nodes in clone
-                for t in new_p.iter(f"{{{W_NS}}}t"):
-                    t.text = ""
-                last_p.addnext(new_p)
+                tgt_cell.add_paragraph()
 
-            # Re-read after sync
-            tgt_paragraphs = tgt_cell.paragraphs
-
-            # Remove excess C1 paragraphs (keep at least 1)
             while len(tgt_cell.paragraphs) > src_count and len(tgt_cell.paragraphs) > 1:
                 excess = tgt_cell.paragraphs[-1]
                 tgt_cell._tc.remove(excess._p)
 
             tgt_paragraphs = tgt_cell.paragraphs
 
-            # --- Write translations into each C1 paragraph ---
+            # Write translations into each C1 paragraph
             for para_idx, src_p in enumerate(src_paragraphs):
                 source_text = src_p.text.strip()
                 if not is_translatable(source_text):
-                    # Non-translatable paragraphs are NOT counted in extract_indexed_segments;
-                    # do NOT increment seg_index here to keep indexes aligned.
                     continue
 
-                target_text: Optional[str] = index_to_target.get(seg_index)
+                target_text: Optional[str] = None
+                if index_to_target and seg_index in index_to_target:
+                    target_text = index_to_target[seg_index]
+                elif translations and source_text in translations:
+                    target_text = translations[source_text]
+
                 seg_index += 1
 
                 if target_text is None:
                     continue
 
+                if is_bn:
+                    target_text = to_bn_digits(target_text)
+
                 if para_idx < len(tgt_paragraphs):
                     tgt_p = tgt_paragraphs[para_idx]
-                    # Clone paragraph formatting from C0 into C1
                     _clone_paragraph_format(src_p, tgt_p)
-                    update_paragraph_text(tgt_p, target_text)
-
-        table_counter += 1
+                    update_paragraph_text(tgt_p, target_text, src_p=src_p)
 
     out_buf = io.BytesIO()
     doc.save(out_buf)
@@ -404,21 +468,37 @@ def reconstruct_docx(
     index_to_target: Optional[Dict[int, str]] = None,
     bilingual_target_col: Optional[int] = None,
     bilingual_source_col: int = 0,
+    tl: str = "bn",
 ) -> bytes:
     """Replaces text in a DOCX document with translated text.
     Uses the strict sequential index map to map translations precisely back to their
     original XML nodes, ensuring formatting, bullet structures, and layout integrity are fully preserved.
 
-    When `bilingual_target_col` is set, dispatches to `reconstruct_docx_bilingual` which
-    writes translations only into the target column (e.g. C1), never touching C0 source text.
+    When `bilingual_target_col` is set (or auto-detected for bilingual documents),
+    dispatches to `reconstruct_docx_bilingual` which writes translations only into
+    the target column (e.g. C1), never touching C0 source text.
     """
-    if bilingual_target_col is not None and index_to_target:
+    is_bn = tl.lower() in ("bn", "ben", "bengali")
+
+    # Auto-detect bilingual mode if not explicitly specified
+    if bilingual_target_col is None:
+        try:
+            doc_preview = docx.Document(io.BytesIO(docx_bytes))
+            if any(is_bilingual_table(t, 0, 1) for t in doc_preview.tables):
+                bilingual_target_col = 1
+                bilingual_source_col = 0
+        except Exception:
+            pass
+
+    if bilingual_target_col is not None and (index_to_target or translations):
         try:
             return reconstruct_docx_bilingual(
                 docx_bytes,
-                index_to_target,
+                index_to_target=index_to_target or {},
                 source_col=bilingual_source_col,
                 target_col=bilingual_target_col,
+                translations=translations,
+                tl=tl,
             )
         except Exception as exc:
             log.warning(
@@ -443,7 +523,9 @@ def reconstruct_docx(
                 target_text = translations[source]
 
             if target_text is not None:
-                update_paragraph_text(p, target_text)
+                if is_bn:
+                    target_text = to_bn_digits(target_text)
+                update_paragraph_text(p, target_text, src_p=p)
 
             seg_index += 1
 
@@ -453,17 +535,19 @@ def reconstruct_docx(
 
     except Exception as exc:
         log.warning("python-docx reconstruction failed (%s), falling back to XML stream replacement", exc)
-        return _reconstruct_docx_xml_fallback(docx_bytes, translations, index_to_target=index_to_target)
+        return _reconstruct_docx_xml_fallback(docx_bytes, translations, index_to_target=index_to_target, tl=tl)
 
 
 def _reconstruct_docx_xml_fallback(
     docx_bytes: bytes,
     translations: Dict[str, str],
     index_to_target: Optional[Dict[int, str]] = None,
+    tl: str = "bn",
 ) -> bytes:
     """Fallback XML rebuilder for minimal non-OPC zip archives or corrupted packages.
     Iterates all <w:p> nodes in XML document order to maintain index synchronization.
     """
+    is_bn = tl.lower() in ("bn", "ben", "bengali")
     in_buf = io.BytesIO(docx_bytes)
     out_buf = io.BytesIO()
 
@@ -487,9 +571,12 @@ def _reconstruct_docx_xml_fallback(
                             target = translations[combined]
 
                         if target is not None:
+                            if is_bn:
+                                target = to_bn_digits(target)
                             t_nodes = list(p.iter(f"{{{W_NS}}}t"))
                             if t_nodes:
-                                t_nodes[0].text = target
+                                lines = target.split("\n")
+                                t_nodes[0].text = lines[0]
                                 for remaining in t_nodes[1:]:
                                     remaining.text = ""
 
