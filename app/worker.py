@@ -158,7 +158,7 @@ class LovableWorkerClient:
         resp.raise_for_status()
 
 
-from .document import extract_segments_from_docx, reconstruct_docx
+from .doc_processor import extract_segments_from_docx, reconstruct_docx
 
 
 class JobProcessor:

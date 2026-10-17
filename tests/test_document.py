@@ -1,20 +1,24 @@
-"""Tests for app.document module.
+"""Tests for app.doc_processor and app.document modules.
 Verifies:
-1. Multi-paragraph table cells are explicitly iterated via cell.paragraphs (never flattened or skipped).
-2. Each paragraph inside table cells is extracted as an individual translatable segment.
-3. Writing translated text preserves paragraph structures, runs, and bullet list styles (w:numPr).
-4. Full reconstruction of real docx files with tables and multi-paragraph cells.
+1. Strict, sequential XML document order extraction: structural headings ("Topic X"),
+   body paragraphs, and multi-paragraph table cells are interleaved correctly without index drift.
+2. Every paragraph inside table cells (cell.paragraphs) is extracted with detailed metadata
+   (paragraph_index, table_index, row_index, col_index, cell_paragraph_index).
+3. Safe write-back precisely targets original XML nodes via index_to_target mapping,
+   preserving bullet formatting (w:numPr), styles, and preventing mixed-language lines.
+4. Merged cell deduplication and nested table recursive traversal.
 """
 import io
 import unittest
 
 import docx
-from docx.oxml import parse_xml
-from docx.oxml.ns import nsdecls
-
-from app.document import (
+from app.doc_processor import (
+    DocumentSegment,
+    detect_element_type,
+    extract_indexed_segments,
     extract_segments_from_docx,
     is_translatable,
+    iter_document_elements,
     iter_document_paragraphs,
     iter_table_paragraphs,
     reconstruct_docx,
@@ -57,6 +61,10 @@ class TestDocumentProcessing(unittest.TestCase):
         p3 = cell_11.add_paragraph(style="List Bullet")
         r3 = p3.add_run("Bullet point C: Automated retry")
 
+        # Heading and paragraph AFTER the table
+        doc.add_heading("Topic 2: Advanced Processing", level=1)
+        doc.add_paragraph("Concluding body paragraph after table.")
+
         buf = io.BytesIO()
         doc.save(buf)
         return buf.getvalue()
@@ -68,12 +76,6 @@ class TestDocumentProcessing(unittest.TestCase):
         table = doc.tables[0]
 
         table_paras = list(iter_table_paragraphs(table))
-        # Total paragraphs across table:
-        # cell (0,0): 1
-        # cell (0,1): 1
-        # cell (1,0): 1
-        # cell (1,1): 3
-        # Total = 6 paragraphs
         self.assertEqual(len(table_paras), 6)
 
         texts = [p.text for p in table_paras]
@@ -81,26 +83,116 @@ class TestDocumentProcessing(unittest.TestCase):
         self.assertIn("Bullet point B: Robust error isolation", texts)
         self.assertIn("Bullet point C: Automated retry", texts)
 
+    def test_strict_interleaved_document_order(self):
+        """CRITICAL: Headings, body paragraphs, and table cells must be extracted in true XML document order.
+        Headings after tables ('Topic 2') must never be desynchronized or swapped with table cells.
+        """
+        docx_bytes = self._create_sample_docx_with_multi_paragraph_table()
+        indexed_segments = extract_indexed_segments(docx_bytes)
+
+        # Expected 10 segments in strict document sequence:
+        # 0: Heading: "Document Title"
+        # 1: Body: "This is a lead body paragraph."
+        # 2: Table Cell (0,0): "Header 1"
+        # 3: Table Cell (0,1): "Header 2"
+        # 4: Table Cell (1,0): "Feature item"
+        # 5: Table Cell (1,1,0): "Bullet point A: High performance"
+        # 6: Table Cell (1,1,1): "Bullet point B: Robust error isolation"
+        # 7: Table Cell (1,1,2): "Bullet point C: Automated retry"
+        # 8: Heading: "Topic 2: Advanced Processing"  <-- Must come AFTER table!
+        # 9: Body: "Concluding body paragraph after table."
+        self.assertEqual(len(indexed_segments), 10)
+
+        # Verify sequential indices
+        for expected_idx, seg in enumerate(indexed_segments):
+            self.assertEqual(seg.segment_index, expected_idx)
+
+        # Verify element types and positions
+        self.assertEqual(indexed_segments[0].source_text, "Document Title")
+        self.assertEqual(indexed_segments[0].element_type, "heading")
+        self.assertIsNone(indexed_segments[0].table_index)
+
+        self.assertEqual(indexed_segments[1].source_text, "This is a lead body paragraph.")
+        self.assertEqual(indexed_segments[1].element_type, "paragraph")
+
+        self.assertEqual(indexed_segments[2].source_text, "Header 1")
+        self.assertEqual(indexed_segments[2].table_index, 0)
+        self.assertEqual(indexed_segments[2].row_index, 0)
+        self.assertEqual(indexed_segments[2].col_index, 0)
+
+        self.assertEqual(indexed_segments[5].source_text, "Bullet point A: High performance")
+        self.assertEqual(indexed_segments[5].cell_paragraph_index, 0)
+        self.assertTrue(indexed_segments[5].has_bullet)
+
+        self.assertEqual(indexed_segments[6].source_text, "Bullet point B: Robust error isolation")
+        self.assertEqual(indexed_segments[6].cell_paragraph_index, 1)
+
+        self.assertEqual(indexed_segments[7].source_text, "Bullet point C: Automated retry")
+        self.assertEqual(indexed_segments[7].cell_paragraph_index, 2)
+
+        # Heading AFTER table must be at index 8 with table_index=None
+        self.assertEqual(indexed_segments[8].source_text, "Topic 2: Advanced Processing")
+        self.assertEqual(indexed_segments[8].element_type, "heading")
+        self.assertIsNone(indexed_segments[8].table_index)
+
+        self.assertEqual(indexed_segments[9].source_text, "Concluding body paragraph after table.")
+        self.assertIsNone(indexed_segments[9].table_index)
+
     def test_extract_segments_from_docx_individual_segments(self):
-        """Each paragraph inside table cells is extracted as an individual translatable segment."""
+        """extract_segments_from_docx returns strings in exact sequential order."""
         docx_bytes = self._create_sample_docx_with_multi_paragraph_table()
         segments = extract_segments_from_docx(docx_bytes)
 
-        # Expected segments in document order:
-        # 1. "Document Title"
-        # 2. "This is a lead body paragraph."
-        # 3. "Header 1"
-        # 4. "Header 2"
-        # 5. "Feature item"
-        # 6. "Bullet point A: High performance"
-        # 7. "Bullet point B: Robust error isolation"
-        # 8. "Bullet point C: Automated retry"
-        self.assertEqual(len(segments), 8)
+        self.assertEqual(len(segments), 10)
         self.assertEqual(segments[0], "Document Title")
         self.assertEqual(segments[1], "This is a lead body paragraph.")
+        self.assertEqual(segments[2], "Header 1")
         self.assertEqual(segments[5], "Bullet point A: High performance")
-        self.assertEqual(segments[6], "Bullet point B: Robust error isolation")
         self.assertEqual(segments[7], "Bullet point C: Automated retry")
+        self.assertEqual(segments[8], "Topic 2: Advanced Processing")
+        self.assertEqual(segments[9], "Concluding body paragraph after table.")
+
+    def test_safe_write_back_with_index_map(self):
+        """Precise write-back using index_to_target guarantees zero desync, zero mixed-language lines."""
+        docx_bytes = self._create_sample_docx_with_multi_paragraph_table()
+
+        # Map each index 0..9 to a distinct Bengali translation
+        index_translations = {
+            0: "নথির শিরোনাম",
+            1: "এটি একটি প্রাথমিক মূল অনুচ্ছেদ।",
+            2: "শিরোনাম ১",
+            3: "শিরোনাম ২",
+            4: "বৈশিষ্ট্য উপাদান",
+            5: "বুলেট ক: উচ্চ কর্মক্ষমতা",
+            6: "বুলেট খ: ত্রুটি বিচ্ছিন্নতা",
+            7: "বুলেট গ: স্বয়ংক্রিয় পুনঃচেষ্টা",
+            8: "বিষয় ২: উন্নত প্রক্রিয়াকরণ",
+            9: "টেবিলের পরে চূড়ান্ত অনুচ্ছেদ।",
+        }
+
+        reconstructed_bytes = reconstruct_docx(docx_bytes, translations={}, index_to_target=index_translations)
+        reconstructed_doc = docx.Document(io.BytesIO(reconstructed_bytes))
+
+        reconstructed_segments = extract_segments_from_docx(reconstructed_doc)
+        self.assertEqual(len(reconstructed_segments), 10)
+
+        # Verify Heading 1
+        self.assertEqual(reconstructed_segments[0], "নথির শিরোনাম")
+        # Verify Table cells
+        self.assertEqual(reconstructed_segments[2], "শিরোনাম ১")
+        self.assertEqual(reconstructed_segments[5], "বুলেট ক: উচ্চ কর্মক্ষমতা")
+        self.assertEqual(reconstructed_segments[6], "বুলেট খ: ত্রুটি বিচ্ছিন্নতা")
+        self.assertEqual(reconstructed_segments[7], "বুলেট গ: স্বয়ংক্রিয় পুনঃচেষ্টা")
+        # Verify Heading 2 AFTER table is correctly translated (not swapped!)
+        self.assertEqual(reconstructed_segments[8], "বিষয় ২: উন্নত প্রক্রিয়াকরণ")
+        self.assertEqual(reconstructed_segments[9], "টেবিলের পরে চূড়ান্ত অনুচ্ছেদ।")
+
+        # Verify formatting integrity on multi-paragraph cell
+        multi_cell = reconstructed_doc.tables[0].cell(1, 1)
+        self.assertEqual(len(multi_cell.paragraphs), 3)
+        self.assertTrue(multi_cell.paragraphs[0].runs[0].bold)
+        self.assertTrue(multi_cell.paragraphs[1].runs[0].italic)
+        self.assertEqual(multi_cell.paragraphs[0].style.name, "List Bullet")
 
     def test_update_paragraph_text_preserves_formatting_and_runs(self):
         """Updating paragraph text retains run styling (bold, italic) and paragraph style."""
@@ -115,43 +207,10 @@ class TestDocumentProcessing(unittest.TestCase):
         self.assertEqual(p.style.name, "List Bullet")
         self.assertTrue(p.runs[0].bold)
 
-    def test_reconstruct_docx_multi_paragraph_cells(self):
-        """Translating and reconstructing a docx updates each cell paragraph independently."""
-        docx_bytes = self._create_sample_docx_with_multi_paragraph_table()
-        translations = {
-            "Document Title": "নথির শিরোনাম",
-            "This is a lead body paragraph.": "এটি একটি প্রাথমিক মূল অনুচ্ছেদ।",
-            "Header 1": "শিরোনাম ১",
-            "Header 2": "শিরোনাম ২",
-            "Feature item": "বৈশিষ্ট্য উপাদান",
-            "Bullet point A: High performance": "বুলেট পয়েন্ট ক: উচ্চ কর্মক্ষমতা",
-            "Bullet point B: Robust error isolation": "বুলেট পয়েন্ট খ: শক্তিশালী ত্রুটি বিচ্ছিন্নতা",
-            "Bullet point C: Automated retry": "বুলেট পয়েন্ট গ: স্বয়ংক্রিয় পুনঃচেষ্টা",
-        }
-
-        reconstructed_bytes = reconstruct_docx(docx_bytes, translations)
-        reconstructed_doc = docx.Document(io.BytesIO(reconstructed_bytes))
-
-        # Check multi-paragraph cell (1, 1)
-        multi_cell = reconstructed_doc.tables[0].cell(1, 1)
-        self.assertEqual(len(multi_cell.paragraphs), 3)
-
-        self.assertEqual(multi_cell.paragraphs[0].text, "বুলেট পয়েন্ট ক: উচ্চ কর্মক্ষমতা")
-        self.assertEqual(multi_cell.paragraphs[0].style.name, "List Bullet")
-        self.assertTrue(multi_cell.paragraphs[0].runs[0].bold)
-
-        self.assertEqual(multi_cell.paragraphs[1].text, "বুলেট পয়েন্ট খ: শক্তিশালী ত্রুটি বিচ্ছিন্নতা")
-        self.assertEqual(multi_cell.paragraphs[1].style.name, "List Bullet")
-        self.assertTrue(multi_cell.paragraphs[1].runs[0].italic)
-
-        self.assertEqual(multi_cell.paragraphs[2].text, "বুলেট পয়েন্ট গ: স্বয়ংক্রিয় পুনঃচেষ্টা")
-        self.assertEqual(multi_cell.paragraphs[2].style.name, "List Bullet")
-
     def test_merged_cells_deduplication(self):
         """Merged cells are not processed repeatedly."""
         doc = docx.Document()
         table = doc.add_table(rows=2, cols=2)
-        # Merge top row cells (0, 0) and (0, 1)
         cell_00 = table.cell(0, 0)
         cell_01 = table.cell(0, 1)
         cell_00.merge(cell_01)
@@ -161,13 +220,12 @@ class TestDocumentProcessing(unittest.TestCase):
         table.cell(1, 1).paragraphs[0].text = "Row 2 Col 2"
 
         paras = list(iter_table_paragraphs(table))
-        # Merged header should only appear once!
         merged_count = sum(1 for p in paras if p.text == "Merged Header")
         self.assertEqual(merged_count, 1)
         self.assertEqual(len(paras), 3)
 
     def test_nested_tables_traversal(self):
-        """Nested tables within cells are recursively processed."""
+        """Nested tables within cells are recursively processed in order."""
         doc = docx.Document()
         outer_table = doc.add_table(rows=1, cols=1)
         cell = outer_table.cell(0, 0)
