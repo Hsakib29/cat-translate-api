@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import socket
+import threading
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -33,12 +36,33 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
     socket.setdefaulttimeout(settings.engine_timeout_seconds + 10)  # safety net for libraries with no timeout
     pipe = pipeline or Pipeline(build_engines(settings), settings)
 
+    worker_daemon = None
+    if os.environ.get("WORKER_AUTOSTART", "").lower() in ("true", "1", "yes"):
+        try:
+            from .worker import WorkerConfig, WorkerDaemon
+            config = WorkerConfig.from_env()
+            if config:
+                worker_daemon = WorkerDaemon(config, pipe)
+        except Exception as exc:
+            log.warning("Could not initialize worker autostart: %s", exc)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if worker_daemon:
+            t = threading.Thread(target=worker_daemon.run, daemon=True, name="cat-worker")
+            t.start()
+            log.info("Background translation worker thread started.")
+        yield
+        if worker_daemon:
+            worker_daemon.stop()
+
     app = FastAPI(
         title="CAT Translate API",
         version=__version__,
         docs_url="/docs" if settings.enable_docs else None,
         redoc_url=None,
         openapi_url="/openapi.json" if settings.enable_docs else None,
+        lifespan=lifespan,
     )
     origins, origin_regex = build_cors(settings.allowed_origins, settings.allow_localhost)
     app.add_middleware(
@@ -111,4 +135,3 @@ def __getattr__(name: str):
     if name == "app":
         return create_app()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
