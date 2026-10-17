@@ -152,35 +152,7 @@ class LovableWorkerClient:
         resp.raise_for_status()
 
 
-def reconstruct_docx(docx_bytes: bytes, translations: Dict[str, str]) -> bytes:
-    """Replaces text in word/document.xml with translated text.
-    Preserves styles, run formatting, tables, and XML document structure.
-    """
-    in_buf = io.BytesIO(docx_bytes)
-    out_buf = io.BytesIO()
-
-    with zipfile.ZipFile(in_buf, "r") as zin, zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename == "word/document.xml":
-                try:
-                    tree = ET.fromstring(data)
-                    for p in tree.iter(f"{{{W_NS}}}p"):
-                        p_texts = [node.text for node in p.iter(f"{{{W_NS}}}t") if node.text]
-                        combined = "".join(p_texts).strip()
-                        if combined and combined in translations:
-                            target = translations[combined]
-                            t_nodes = list(p.iter(f"{{{W_NS}}}t"))
-                            if t_nodes:
-                                t_nodes[0].text = target
-                                for remaining in t_nodes[1:]:
-                                    remaining.text = ""
-                    data = ET.tostring(tree, encoding="utf-8", xml_declaration=True)
-                except Exception as exc:
-                    log.warning("DOCX XML reconstruction warning: %s", exc)
-            zout.writestr(item, data)
-
-    return out_buf.getvalue()
+from .document import extract_segments_from_docx, reconstruct_docx
 
 
 class JobProcessor:
