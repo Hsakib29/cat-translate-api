@@ -33,9 +33,11 @@ class WorkerConfig:
     poll_interval: float = 5.0
     idle_backoff_max: float = 30.0
     batch_size: int = 20
-    chunk_size: int = 10
+    chunk_size: int = 5
     timeout_seconds: float = 60.0
     max_chunk_retries: int = 2
+    supabase_url: str = ""
+    supabase_key: str = ""
 
     @classmethod
     def from_env(cls) -> Optional[WorkerConfig]:
@@ -47,10 +49,14 @@ class WorkerConfig:
         ).strip().rstrip("/")
         poll_interval = float(os.environ.get("POLL_INTERVAL", "5.0"))
         batch_size = max(1, min(100, int(os.environ.get("BATCH_SIZE", "20"))))
-        chunk_size = max(1, min(20, int(os.environ.get("CHUNK_SIZE", "10"))))
+        chunk_size = max(1, min(20, int(os.environ.get("CHUNK_SIZE", "5"))))
         max_chunk_retries = max(0, min(5, int(os.environ.get("MAX_CHUNK_RETRIES", "2"))))
         idle_backoff_max = float(os.environ.get("IDLE_BACKOFF_MAX", "30.0"))
         timeout = float(os.environ.get("WORKER_HTTP_TIMEOUT", "60.0"))
+        supabase_url = os.environ.get("SUPABASE_URL", "").strip()
+        supabase_key = (
+            os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or os.environ.get("SUPABASE_KEY", "")
+        ).strip()
 
         return cls(
             lovable_base_url=base_url,
@@ -61,6 +67,8 @@ class WorkerConfig:
             chunk_size=chunk_size,
             timeout_seconds=timeout,
             max_chunk_retries=max_chunk_retries,
+            supabase_url=supabase_url,
+            supabase_key=supabase_key,
         )
 
 
@@ -125,6 +133,86 @@ class LovableWorkerClient:
         resp.raise_for_status()
         return resp.content
 
+    def get_glossary(
+        self,
+        job_id: str,
+        project_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Fetches custom glossary terms for the job's project.
+        Checks GET /glossary on the Lovable server, returning a normalized dict {src: tgt}.
+        """
+        try:
+            params: Dict[str, str] = {"job_id": job_id}
+            if project_id:
+                params["project_id"] = project_id
+            if user_id:
+                params["user_id"] = user_id
+            resp = self.client.get("/glossary", params=params)
+            if resp.status_code == 200:
+                raw = resp.json().get("glossary", {})
+                return self._parse_glossary_payload(raw)
+        except Exception as exc:
+            log.warning("Could not fetch glossary via API for Job %s: %s", job_id, exc)
+
+        if self.config.supabase_url and self.config.supabase_key:
+            return self._fetch_glossary_from_supabase(project_id, user_id)
+
+        return {}
+
+    @staticmethod
+    def _parse_glossary_payload(raw: Any) -> Dict[str, str]:
+        """Normalizes glossary payloads (list of dicts or key-value map) into {src: tgt}."""
+        result: Dict[str, str] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, str) and k.strip() and v.strip():
+                    result[k.strip()] = v.strip()
+                elif isinstance(v, dict):
+                    src = v.get("src") or v.get("term") or k
+                    tgt = v.get("tgt") or v.get("translation")
+                    if src and tgt:
+                        result[str(src).strip()] = str(tgt).strip()
+        elif isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    src = item.get("src") or item.get("term")
+                    tgt = item.get("tgt") or item.get("translation")
+                    if src and tgt and str(src).strip() and str(tgt).strip():
+                        result[str(src).strip()] = str(tgt).strip()
+        return result
+
+    def _fetch_glossary_from_supabase(
+        self, project_id: Optional[str], user_id: Optional[str]
+    ) -> Dict[str, str]:
+        """Direct fallback query to Supabase REST endpoint (cat_projects table)."""
+        try:
+            headers = {
+                "apikey": self.config.supabase_key,
+                "Authorization": f"Bearer {self.config.supabase_key}",
+                "Accept": "application/json",
+            }
+            url = f"{self.config.supabase_url.rstrip('/')}/rest/v1/cat_projects"
+            params: Dict[str, str] = {"select": "glossary,project"}
+            if project_id:
+                params["id"] = f"eq.{project_id}"
+            elif user_id:
+                params["user_id"] = f"eq.{user_id}"
+            else:
+                return {}
+
+            resp = httpx.get(url, headers=headers, params=params, timeout=10.0)
+            if resp.status_code == 200:
+                rows = resp.json()
+                if rows and isinstance(rows, list):
+                    first = rows[0]
+                    glossary_data = first.get("glossary") or first.get("project", {}).get("glossary")
+                    if glossary_data:
+                        return self._parse_glossary_payload(glossary_data)
+        except Exception as exc:
+            log.warning("Direct Supabase glossary query failed: %s", exc)
+        return {}
+
     def upload_translated_file(
         self, user_id: str, job_id: str, filename: str, docx_bytes: bytes
     ) -> str:
@@ -161,6 +249,7 @@ class LovableWorkerClient:
 import docx
 from .doc_processor import extract_segments_from_docx, is_bilingual_table, reconstruct_docx
 from .textutils import to_bn_digits
+from .utils.glossary import protect_terms, restore_terms
 
 
 class JobProcessor:
@@ -172,7 +261,7 @@ class JobProcessor:
         api: LovableWorkerClient,
         pipeline: Pipeline,
         batch_size: int = 20,
-        chunk_size: int = 10,
+        chunk_size: int = 5,
         max_chunk_retries: int = 2,
     ):
         self.api = api
@@ -196,6 +285,19 @@ class JobProcessor:
             job_id, filename, total_segments, sl, tl, self.batch_size, self.chunk_size
         )
 
+        # Retrieve and attach project custom glossary to job context
+        raw_glossary = job.get("glossary")
+        project_id = job.get("project_id")
+        if raw_glossary:
+            glossary = LovableWorkerClient._parse_glossary_payload(raw_glossary)
+        elif project_id or (self.api.config.supabase_url and self.api.config.supabase_key):
+            glossary = self.api.get_glossary(job_id=job_id, project_id=project_id, user_id=user_id)
+        else:
+            glossary = {}
+        job["glossary"] = glossary
+        if glossary:
+            log.info("Job %s: Loaded %d custom glossary terms for translation.", job_id, len(glossary))
+
         source_to_target: Dict[str, str] = {}
         index_to_target: Dict[int, str] = {}
         processed_count = 0
@@ -217,12 +319,23 @@ class JobProcessor:
                 if not pending:
                     break
 
-                # Partition into safe, controlled chunks of 10 to 20 segments maximum per request
+                # Partition into safe, controlled chunks of 5 segments maximum per request
                 chunks = [pending[i:i + self.chunk_size] for i in range(0, len(pending), self.chunk_size)]
 
                 for chunk in chunks:
                     total_chunks += 1
-                    chunk_source_texts = [seg.get("source_text", "") for seg in chunk]
+
+                    # Protect glossary terms before submitting chunk to pipeline
+                    chunk_source_texts: List[str] = []
+                    chunk_token_maps: List[Dict[str, str]] = []
+                    for seg in chunk:
+                        raw_src = seg.get("source_text", "")
+                        if glossary:
+                            prot_text, tok_map = protect_terms(raw_src, glossary)
+                        else:
+                            prot_text, tok_map = raw_src, {}
+                        chunk_source_texts.append(prot_text)
+                        chunk_token_maps.append(tok_map)
 
                     # Chunk translation with retry and error isolation
                     results = None
@@ -244,13 +357,36 @@ class JobProcessor:
                     chunk_submission = []
                     for idx, seg in enumerate(chunk):
                         res = results[idx] if (results and idx < len(results)) else None
+                        tok_map = chunk_token_maps[idx] if idx < len(chunk_token_maps) else {}
+
                         if res and res.text is not None:
-                            target_text = res.text
-                            status = "translated"
+                            target_text = restore_terms(res.text, tok_map) if tok_map else res.text
                         else:
-                            # Safe fallback so segment doesn't hang indefinitely in pending
-                            target_text = seg.get("source_text", "")
-                            status = "translated"
+                            # Per-segment isolated fallback: if batch failed or segment was omitted,
+                            # attempt single-segment translation with glossary protection
+                            source_text = seg.get("source_text", "")
+                            target_text = None
+                            if len(chunk) > 1 and source_text.strip():
+                                try:
+                                    prot_single, single_map = (
+                                        protect_terms(source_text, glossary) if glossary else (source_text, {})
+                                    )
+                                    single_res, _ = self.pipeline.run_batch([prot_single], sl=sl, tl=tl)
+                                    if single_res and single_res[0].text is not None:
+                                        target_text = (
+                                            restore_terms(single_res[0].text, single_map)
+                                            if single_map
+                                            else single_res[0].text
+                                        )
+                                except Exception as seg_err:
+                                    log.warning(
+                                        "Job %s: Per-segment fallback for segment %s failed: %s",
+                                        job_id, seg.get("id"), seg_err
+                                    )
+                            if target_text is None:
+                                target_text = source_text
+
+                        status = "translated"
 
                         # Apply digit localization for Bengali target language
                         if is_bn:
@@ -274,8 +410,8 @@ class JobProcessor:
                     if results is None:
                         failed_chunks += 1
                         log.warning(
-                            "Job %s: Chunk %d failed after %d attempts (%s); recovered %d segments via source fallback.",
-                            job_id, total_chunks, self.max_chunk_retries + 1, last_chunk_err, len(chunk)
+                            "Job %s: Chunk %d batch attempt failed (%s); executed per-segment recovery.",
+                            job_id, total_chunks, last_chunk_err
                         )
 
                     # Submit translated chunk to database with retry

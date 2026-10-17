@@ -195,21 +195,37 @@ class GeminiEngine(Engine):
         if not isinstance(parsed, dict):
             raise EngineError(EMPTY, f"Gemini model {model} output is not a JSON dictionary.")
 
-        if len(parsed) != len(segments):
-            raise EngineError(
-                EMPTY,
-                f"Gemini model {model} segment count mismatch: expected {len(segments)}, got {len(parsed)}."
-            )
-
+        # Partial-recovery loop: Iterate over the expected sequence keys (1..N).
+        # Rather than discarding the whole chunk when the model drops or merges a key,
+        # salvage all valid translations and substitute source text only for missing/corrupt slots.
         results: list[str] = []
+        recovered = 0
+        fallback_slots: list[str] = []
+        last_tag_error: str | None = None
+
         for i, source_text in enumerate(segments, start=1):
             key = str(i)
-            if key not in parsed:
-                raise EngineError(EMPTY, f"Gemini model {model} output missing sequence key '{key}'.")
+            val = parsed.get(key)
 
-            translated_raw = str(parsed[key]).strip()
+            if val is None:
+                log.warning(
+                    "Gemini model %s: key '%s' absent in response (%d/%d keys returned). "
+                    "Substituting source text for this slot.",
+                    model, key, len(parsed), len(segments),
+                )
+                results.append(source_text)
+                fallback_slots.append(key)
+                continue
+
+            translated_raw = str(val).strip()
             if not translated_raw:
-                raise EngineError(EMPTY, f"Gemini model {model} returned empty segment text for '{key}'.")
+                log.warning(
+                    "Gemini model %s: key '%s' has empty translation. Substituting source text.",
+                    model, key,
+                )
+                results.append(source_text)
+                fallback_slots.append(key)
+                continue
 
             # Normalize digits to ASCII 0-9
             normalized = normalize_ascii_digits(translated_raw)
@@ -217,8 +233,27 @@ class GeminiEngine(Engine):
             # Validate tag preservation (e.g. {0})
             tags_ok, missing_tag = check_tags_preserved(source_text, normalized)
             if not tags_ok:
-                raise EngineError(EMPTY, f"Gemini model {model} lost tag '{missing_tag}' in translation.")
+                last_tag_error = missing_tag
+                log.warning(
+                    "Gemini model %s: key '%s' lost tag '%s'. Substituting source text.",
+                    model, key, missing_tag,
+                )
+                results.append(source_text)
+                fallback_slots.append(key)
+                continue
 
             results.append(normalized)
+            recovered += 1
+
+        # If zero segments were salvaged, trip EngineError so fallback engines or models can try
+        if recovered == 0:
+            detail = f"lost tag '{last_tag_error}'" if last_tag_error else f"0/{len(segments)} valid keys"
+            raise EngineError(EMPTY, f"Gemini model {model} {detail} in translation.")
+
+        if fallback_slots:
+            log.warning(
+                "Gemini model %s: partial recovery salvaged %d/%d slots; fallback used for keys: %s",
+                model, recovered, len(segments), fallback_slots,
+            )
 
         return results

@@ -344,6 +344,61 @@ class WorkerTests(unittest.TestCase):
         status_calls = [call for call in mock_http.post.call_args_list if call[0][0] == "/status"]
         self.assertEqual(status_calls[-1][1]["json"]["status"], "completed")
 
+    def test_job_processor_applies_glossary_protection(self):
+        mock_http = MagicMock()
+        pending_segments = [
+            {"id": "seg-1", "segment_index": 0, "source_text": "The Safety Coordinator approved the Safety Guidelines."}
+        ]
+        mock_http.get.side_effect = [
+            fake_resp(200, json={"segments": pending_segments}),
+            fake_resp(200, json={"segments": []}),
+        ]
+        mock_http.post.return_value = fake_resp(200, json={"ok": True})
+
+        client = LovableWorkerClient(self.config, client=mock_http)
+        mock_pipeline = MagicMock()
+
+        received_batch_texts = []
+
+        def fake_run_batch(texts, sl="en", tl="bn"):
+            received_batch_texts.extend(texts)
+            from app.pipeline import Result
+            # Simulates model preserving {0} and {1} in translation
+            return [Result(text="{0} {1} অনুমোদন করেছেন।")], {}
+
+        mock_pipeline.run_batch.side_effect = fake_run_batch
+
+        processor = JobProcessor(client, mock_pipeline, batch_size=10, chunk_size=5)
+        job = {
+            "id": "job-glossary-1",
+            "user_id": "user-1",
+            "file_name": "test.docx",
+            "original_file_path": "",
+            "total_segments": 1,
+            "glossary": {
+                "Safety Coordinator": "নিরাপত্তা সমন্বয়কারী",
+                "Safety Guidelines": "নিরাপত্তা নির্দেশিকা",
+            },
+        }
+
+        processor.process(job)
+
+        # Verify pipeline received protected placeholder tokens instead of raw terms
+        self.assertEqual(len(received_batch_texts), 1)
+        self.assertIn("{0}", received_batch_texts[0])
+        self.assertIn("{1}", received_batch_texts[0])
+        self.assertNotIn("Safety Coordinator", received_batch_texts[0])
+
+        # Verify submission has terms properly restored into target_text
+        submission_calls = [
+            call for call in mock_http.post.call_args_list if call[0][0] == "/segments"
+        ]
+        self.assertEqual(len(submission_calls), 1)
+        saved_target = submission_calls[0][1]["json"]["results"][0]["target_text"]
+        self.assertIn("নিরাপত্তা সমন্বয়কারী", saved_target)
+        self.assertIn("নিরাপত্তা নির্দেশিকা", saved_target)
+
 
 if __name__ == "__main__":
     unittest.main()
+
